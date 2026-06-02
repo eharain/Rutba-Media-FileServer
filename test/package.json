@@ -1,0 +1,12 @@
+{
+  "name": "rutba-media-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Test suite for the media service + Strapi provider",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "sharp": "^0.33.5"
+  }
+}

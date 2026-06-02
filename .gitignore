@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+*/node_modules/
+test/node_modules/
+migrate/node_modules/
+provider/node_modules/
+
+# Runtime cache / generated variants
+.cache/
+**/.cache/
+
+# Temp / atomic-write artifacts
+*.tmp
+*.tmp.*
+
+# Logs
+*.log
+npm-debug.log*
+
+# Local media (never commit masters/originals)
+public/
+**/masters/
+**/data/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Claude Code machine-local settings
+.claude/settings.local.json

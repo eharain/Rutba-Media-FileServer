@@ -1,0 +1,19 @@
+{
+  "name": "rutba-media-migrate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DB-driven migration of Strapi media to the masters-only media service",
+  "main": "migrate.js",
+  "scripts": {
+    "start": "node migrate.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.5"
+  },
+  "optionalDependencies": {
+    "pg": "^8.13.1"
+  }
+}

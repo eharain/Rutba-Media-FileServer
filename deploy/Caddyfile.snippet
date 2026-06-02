@@ -1,0 +1,14 @@
+# Add to the shared edge Caddyfile (e.g. deploy/edge/Caddyfile in the ERP repo),
+# then: docker compose -f docker-compose.edge.yml exec caddy caddy reload --config /etc/caddy/Caddyfile
+#
+# Requires DNS: images.rutba.pk  A -> the VPS IP (187.124.114.202)
+# and the image-server container on the same external `edge` network.
+
+images.rutba.pk {
+	reverse_proxy image-server:3000
+}
+
+# For trustlist (once images.trustlist.uk -> VPS and a second container `image-server-tl`):
+# images.trustlist.uk {
+# 	reverse_proxy image-server-tl:3000
+# }

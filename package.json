@@ -1,0 +1,20 @@
+{
+  "name": "rutba-image-server",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Masters-only media origin with on-the-fly resize + LRU cache for images.rutba.pk (Hostinger Node.js hosting)",
+  "main": "server.js",
+  "license": "MIT",
+  "author": "Ejaz Arain <eharain@gmail.com>",
+  "scripts": {
+    "start": "node server.js",
+    "pretest": "npm --prefix test install --no-audit --no-fund",
+    "test": "node test/test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "sharp": "^0.33.5"
+  }
+}

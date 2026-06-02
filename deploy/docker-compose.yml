@@ -1,0 +1,43 @@
+# Run the media service on the VPS, joined to the shared `edge` Caddy network.
+#
+#   docker network create edge            # if not already present
+#   MEDIA_UPLOAD_TOKEN=... docker compose up -d --build
+#
+# Then add the Caddyfile.snippet block to the edge Caddy and reload.
+#
+# Masters live in the `media_masters` volume; populate it with the migration
+# script (PUT) or by mounting/copying existing Strapi masters. Cache is ephemeral.
+
+services:
+  image-server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: rutba-image-server:latest
+    container_name: image-server
+    restart: unless-stopped
+    environment:
+      PORT: "3000"
+      MASTER_DIR: /data/masters
+      CACHE_DIR: /data/cache
+      CACHE_MAX_BYTES: "${CACHE_MAX_BYTES:-2147483648}"   # 2 GiB cache cap
+      IMAGE_QUALITY: "${IMAGE_QUALITY:-80}"
+      CORS_ORIGIN: "${CORS_ORIGIN:-*}"
+      UPLOAD_TOKEN: "${MEDIA_UPLOAD_TOKEN:?set MEDIA_UPLOAD_TOKEN}"
+    volumes:
+      - media_masters:/data/masters
+      - media_cache:/data/cache
+      # To serve EXISTING ERP masters without migrating files, you may instead mount
+      # the Strapi uploads volume read-only as the master dir (then only the DB needs
+      # rewriting):
+      #   - rutba-erp_strapi_uploads:/data/masters:ro
+    networks:
+      - edge
+
+networks:
+  edge:
+    external: true
+
+volumes:
+  media_masters:
+  media_cache:
