@@ -37,13 +37,23 @@ let sharp = null;
 try { sharp = require('sharp'); if (sharp.cache) sharp.cache(false); }
 catch { console.warn('[media] sharp unavailable — resize disabled, serving masters as-is. Run: npm install sharp'); }
 
-// Expand a leading `~` / `~/` to the OS home dir (Node does not do this itself),
-// so env like `UPLOAD_DIR=~/uploads/trustlist/` resolves correctly.
+// Resolve the real user home for `~` expansion. Prefer the passwd entry
+// (os.userInfo) over $HOME: some hosts (e.g. LiteSpeed `lsnode` on Hostinger)
+// run the process with HOME set to the app/domain dir, which makes os.homedir()
+// — and therefore `~` — mis-expand. os.userInfo().homedir reads the passwd
+// record and ignores $HOME, so `UPLOAD_DIR=~/uploads/trustlist/` resolves to the
+// real /home/<user>/uploads/... regardless of how HOME was set.
+function userHome() {
+  try { const h = os.userInfo().homedir; if (h) return h; } catch { /* fall through */ }
+  return os.homedir();
+}
+// Expand a leading `~` / `~/` to the user home dir (Node does not do this itself).
 function expandHome(p) {
   if (!p) return p;
-  if (p === '~') return os.homedir();
-  if (p === '~/' || p === '~\\') return os.homedir() + path.sep;
-  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  const home = userHome();
+  if (p === '~') return home;
+  if (p === '~/' || p === '~\\') return home + path.sep;
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(home, p.slice(2));
   return p;
 }
 
