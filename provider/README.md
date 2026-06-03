@@ -2,8 +2,8 @@
 
 Strapi (v4/v5) upload provider for the **Rutba/TrustList standalone media service**
 (`server.js` at the repo root). Stores **only master files** on the service; Strapi's
-responsive variants (`thumbnail_/small_/medium_/large_`) are **not uploaded** — the
-service resizes the master on request. `formats` metadata still works, so no frontend
+responsive variants (`thumbnail_/xsmall_/small_/medium_/large_/xlarge_`, matching Strapi's
+default breakpoints) are **not uploaded** — the service resizes the master on request. `formats` metadata still works, so no frontend
 changes are needed, but disk only ever holds masters.
 
 ## Install

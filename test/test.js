@@ -8,6 +8,7 @@
  * Requires: sharp (test dep). Node >= 18 (global fetch).
  */
 const { spawn } = require('child_process');
+const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -34,7 +35,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 (async () => {
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', MASTER_DIR, CACHE_DIR, UPLOAD_TOKEN: TOKEN, CACHE_MAX_BYTES: '60000' },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', MASTER_DIR, CACHE_DIR, UPLOAD_TOKEN: TOKEN, CACHE_MAX_BYTES: '60000', UPLOAD_MAX_BYTES: '100000' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   srv.stderr.on('data', (d) => process.env.DEBUG && console.error('[srv]', d.toString()));
@@ -74,6 +75,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       await fetch(`${BASE}/pic.jpg`, { method: 'PUT', headers: { Authorization: `Bearer ${TOKEN}` }, body: master });
       const d = await dim(`${BASE}/small_pic.jpg`); assert.equal(d.code, 200); assert.equal(d.width, 500);
     });
+    await t('strapi prefix xsmall_ resolves (64)', async () => {
+      const d = await dim(`${BASE}/xsmall_pic.jpg`); assert.equal(d.code, 200); assert.equal(d.width, 64);
+    });
+    // extension-swap: variant requested as .webp, master is .jpg → locate master,
+    // serve resized in the MASTER's own format (no transcode).
+    await t('strapi prefix ext-swap (small_pic.webp -> pic.jpg @500, kept jpeg)', async () => {
+      const d = await dim(`${BASE}/small_pic.webp`); assert.equal(d.code, 200); assert.equal(d.width, 500); assert.equal(d.format, 'jpeg');
+    });
 
     // video range
     await t('video Range -> 206', async () => {
@@ -86,6 +95,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     // auth
     await t('PUT without token -> 401', async () => { assert.equal(await status(`${BASE}/x.jpg`, { method: 'PUT', body: 'x' }), 401); });
     await t('DELETE without token -> 401', async () => { assert.equal(await status(`${BASE}/general/cover/photoA.jpg`, { method: 'DELETE' }), 401); });
+
+    // upload size limit (cap 100000 bytes via UPLOAD_MAX_BYTES)
+    await t('PUT over size limit -> 413', async () => {
+      const big = Buffer.alloc(150000, 7);
+      assert.equal(await status(`${BASE}/big.bin`, { method: 'PUT', headers: { Authorization: `Bearer ${TOKEN}` }, body: big }), 413);
+      assert.ok(!fs.existsSync(path.join(MASTER_DIR, 'big.bin')), 'oversize upload not stored');
+    });
 
     // traversal / app-file protection
     await t('app file blocked', async () => { assert.equal(await status(`${BASE}/server.js`), 404); });
@@ -106,8 +122,53 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     });
   } finally {
     srv.kill();
-    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
   }
+
+  // ── origin pull-through (separate media server + mock origin) ──────────────
+  await (async () => {
+    const PORT2 = 8732, BASE2 = `http://127.0.0.1:${PORT2}`;
+    const M2 = path.join(tmp, 'm2'), C2 = path.join(tmp, 'c2');
+    fs.mkdirSync(M2, { recursive: true });
+    const masterJpg = await sharp({ create: { width: 1000, height: 600, channels: 3, background: { r: 30, g: 90, b: 160 } } }).jpeg({ quality: 90 }).toBuffer();
+
+    // Mock origin: serves a few masters (only as .jpg), 404 for anything else.
+    const ORIGIN_FILES = { '/orig.jpg': masterJpg, '/deep/o2.jpg': masterJpg, '/swap.jpg': masterJpg };
+    const origin = http.createServer((req, res) => {
+      const body = ORIGIN_FILES[req.url.split('?')[0]];
+      if (body) { res.writeHead(200, { 'Content-Type': 'image/jpeg' }); res.end(body); }
+      else { res.writeHead(404); res.end('nope'); }
+    });
+    await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+    const oport = origin.address().port;
+
+    const srv2 = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+      env: { ...process.env, PORT: String(PORT2), HOST: '127.0.0.1', MASTER_DIR: M2, CACHE_DIR: C2, UPLOAD_TOKEN: TOKEN, ORIGIN_SOURCES: `http://127.0.0.1:${oport}` },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    srv2.stderr.on('data', (d) => process.env.DEBUG && console.error('[srv2]', d.toString()));
+    for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE2 + '/_health')).ok) break; } catch {} await sleep(100); }
+
+    try {
+      await t('origin: missing master fetched, served & persisted', async () => {
+        const d = await dim(`${BASE2}/orig.jpg`); assert.equal(d.code, 200); assert.equal(d.width, 1000);
+        assert.ok(fs.existsSync(path.join(M2, 'orig.jpg')), 'master persisted from origin');
+      });
+      await t('origin: nested master fetched & resized (?w=200)', async () => {
+        const d = await dim(`${BASE2}/deep/o2.jpg?w=200`); assert.equal(d.code, 200); assert.equal(d.width, 200);
+        assert.ok(fs.existsSync(path.join(M2, 'deep', 'o2.jpg')), 'nested master persisted');
+      });
+      await t('origin: prefix + ext-swap fetch (small_swap.webp -> swap.jpg @500, kept jpeg)', async () => {
+        const d = await dim(`${BASE2}/small_swap.webp`); assert.equal(d.code, 200); assert.equal(d.width, 500); assert.equal(d.format, 'jpeg');
+        assert.ok(fs.existsSync(path.join(M2, 'swap.jpg')), 'master located via ext-swap & persisted');
+      });
+      await t('origin: not present at origin -> 404', async () => { assert.equal(await status(`${BASE2}/notthere.jpg`), 404); });
+    } finally {
+      srv2.kill();
+      origin.close();
+    }
+  })();
+
+  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

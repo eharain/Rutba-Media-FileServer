@@ -17,7 +17,7 @@ server.js, package.json, README.md   media service (sharp-only)
 provider/                            Strapi upload provider (strapi-provider-upload-media)
 migrate/                             DB-driven migration (mysql2/pg)
 deploy/                              Dockerfile + compose + Caddy snippet + deploy README
-test/                                automated suite (15 checks)
+test/                                automated suite (22 checks)
 nextjs/                              optional <Image> custom loader (drop-formats path)
 SPEC.md
 ```
@@ -39,23 +39,37 @@ every cache hit touches the file (true LRU).
   - `fit` ∈ `inside|cover|contain|outside|fill` (default `inside`, never upscales).
   - `fm` ∈ `jpeg|png|webp|avif|auto` (`auto` honors `Accept`). `q` 1–100 (default 80).
 - `GET /<dir>/small_<name>.ext` → Strapi-prefix convenience: resize master `<name>` to the
-  `small` width (map `thumbnail=245,small=500,medium=750,large=1000`, override via `VARIANTS`).
+  `small` width (map mirrors Strapi breakpoints + thumbnail:
+  `thumbnail=245,xsmall=64,small=500,medium=750,large=1000,xlarge=1920`, override via `VARIANTS`).
   *Note:* prefix mapping only works when master and variant share a dir/name; the provider
   and migration instead emit `?w=` URLs, which are authoritative.
+  - **Extension-swap:** the requested extension is a hint — if `<name>.<reqExt>` is absent,
+    the same base name is tried against the known master formats (so `/small_x.webp` resolves
+    to master `x.jpg`). Output keeps the **master's own format** (no transcode); `?fm=` still
+    forces conversion.
+- **Origin pull-through (optional, `ORIGIN_SOURCES`):** when a master is missing locally, it
+  is downloaded from the first configured source that has it (trying the same name/format
+  candidates), **persisted under `MASTER_DIR`**, then served at the requested size. No sources
+  / all miss → `404`. Only the configured allow-list is fetched, at traversal-safe paths.
 - `GET /_health` → `200 ok`.
 
 **Writes (require `Authorization: Bearer $UPLOAD_TOKEN`):**
 - `PUT /<path>` (body = bytes) → store/replace a master atomically; invalidate that master's
   cached variants.
 - `DELETE /<path>` → remove master + purge its cached variants. Idempotent (204).
+- PUT bodies over `UPLOAD_MAX_BYTES` (alias `SIZE_LIMIT`, default 256 MiB, mirrors Strapi's
+  `sizeLimit`; `0` disables) are rejected with **413** — checked up-front via `Content-Length`
+  and mid-stream for chunked/mislabeled bodies.
 
 **Headers:** CORS (`CORS_ORIGIN`, default `*`), `Cache-Control: public, max-age=31536000,
 immutable`, `Accept-Ranges`, `X-Content-Type-Options: nosniff`. Path-traversal protected;
 never serve `server.js`/dotfiles.
 
 **Env:** `PORT HOST UPLOAD_DIR CACHE_DIR CACHE_MAX_BYTES IMAGE_QUALITY MAX_DIM VARIANTS
-CORS_ORIGIN UPLOAD_TOKEN` (`UPLOAD_DIR` aka `MASTER_DIR`/`MEDIA_DIR`; dir vars expand a
-leading `~`). Degrades to serving masters unresized if `sharp` is missing.
+CORS_ORIGIN UPLOAD_TOKEN UPLOAD_MAX_BYTES ORIGIN_SOURCES ORIGIN_TIMEOUT_MS` (`UPLOAD_DIR` aka
+`MASTER_DIR`/`MEDIA_DIR`; `UPLOAD_MAX_BYTES` aka `SIZE_LIMIT`; `ORIGIN_SOURCES` =
+space/comma-separated base URLs, default off; dir vars expand a leading `~`). Degrades to
+serving masters unresized if `sharp` is missing.
 
 ## 4. Strapi provider spec (`strapi-provider-upload-media`)
 - `upload`/`uploadStream`: **master** → `PUT {baseUrl}/{folder}/{hash}{ext}`; **responsive
@@ -109,11 +123,14 @@ breakpoint count for new uploads regardless.
 
 ## 9. Tech & acceptance
 - Node ≥18, `sharp` only runtime dep. No framework.
-- **Acceptance — `test/test.js`, 15/15 passing:** health; provider stores master; provider
+- **Acceptance — `test/test.js`, 22/22 passing:** health; provider stores master; provider
   skips variant bytes → `{master}?w=&fm=`; master served full size; `?w=` resizes (aspect
   kept, no upscale); `fm=webp` converts; provider variant URL resolves; Strapi-prefix
-  variant resolves; video Range → 206; `PUT`/`DELETE` → 401 without token; app-file blocked;
-  404 for missing; LRU keeps cache under cap; `provider.delete` purges master.
+  variants resolve (`small`, `xsmall`); prefix extension-swap (`small_x.webp` → master `x.jpg`,
+  kept jpeg); video Range → 206; `PUT`/`DELETE` → 401 without token; oversize `PUT` → 413;
+  app-file blocked; 404 for missing; LRU keeps cache under cap; `provider.delete` purges
+  master; origin pull-through (missing master fetched/persisted/served, nested + resize,
+  prefix+ext-swap, 404 when origin lacks it).
 - **Migration** validated by dry-run against the real `pos_db` (rutba.pk): URLs rewritten,
   `formats` compacted (e.g. 2240 → 871 bytes on the largest row, ~61% smaller).
 - **Done:** service, provider, migration (mysql/pg, dry-run, idempotent), VPS Docker +

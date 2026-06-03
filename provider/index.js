@@ -23,8 +23,13 @@
  *   }
  */
 
-const VARIANT_RE = /^(thumbnail|small|medium|large)_/;
-const VARIANT_W = { thumbnail: 245, small: 500, medium: 750, large: 1000 };
+// Strapi variant prefixes → width (px). Mirrors Strapi's default upload
+// breakpoints (xlarge/large/medium/small/xsmall) plus the always-on thumbnail,
+// so the provider skips uploading ALL responsive-variant bytes and emits `?w=`
+// URLs the media service generates from the master. Keep in sync with the
+// service's VARIANTS map (src/config.js).
+const VARIANT_W = { thumbnail: 245, xsmall: 64, small: 500, medium: 750, large: 1000, xlarge: 1920 };
+const VARIANT_RE = new RegExp('^(' + Object.keys(VARIANT_W).join('|') + ')_');
 
 module.exports = {
   init(options = {}) {

@@ -25,6 +25,6 @@ jobs:
       - name: Install root dependencies
         run: npm install --no-audit --no-fund
 
-      # Runs the 15-check suite (pretest installs the test workspace's deps).
+      # Runs the 22-check suite (pretest installs the test workspace's deps).
       - name: Run tests
         run: npm test
