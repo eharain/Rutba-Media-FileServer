@@ -74,7 +74,7 @@ curl -r 0-1023 -sD - -o /dev/null https://images.rutba.pk/<name>.mp4  # 206
 | Var | Default | Purpose |
 |---|---|---|
 | `PORT` | (Hostinger) | listen port |
-| `MASTER_DIR` | `./public` | originals dir (`MEDIA_DIR` also accepted) |
+| `UPLOAD_DIR` | `./public` | originals/masters dir — where the actual files live. Aliases: `MASTER_DIR`, `MEDIA_DIR` (first one set wins). A leading `~` expands, e.g. `UPLOAD_DIR=~/uploads/trustlist/` |
 | `CACHE_DIR` | `./.cache` | variant cache dir |
 | `CACHE_MAX_BYTES` | `1073741824` (1 GiB) | cache cap before LRU eviction |
 | `IMAGE_QUALITY` | `80` | default output quality |

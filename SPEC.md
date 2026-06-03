@@ -53,8 +53,9 @@ every cache hit touches the file (true LRU).
 immutable`, `Accept-Ranges`, `X-Content-Type-Options: nosniff`. Path-traversal protected;
 never serve `server.js`/dotfiles.
 
-**Env:** `PORT HOST MASTER_DIR CACHE_DIR CACHE_MAX_BYTES IMAGE_QUALITY MAX_DIM VARIANTS
-CORS_ORIGIN UPLOAD_TOKEN`. Degrades to serving masters unresized if `sharp` is missing.
+**Env:** `PORT HOST UPLOAD_DIR CACHE_DIR CACHE_MAX_BYTES IMAGE_QUALITY MAX_DIM VARIANTS
+CORS_ORIGIN UPLOAD_TOKEN` (`UPLOAD_DIR` aka `MASTER_DIR`/`MEDIA_DIR`; dir vars expand a
+leading `~`). Degrades to serving masters unresized if `sharp` is missing.
 
 ## 4. Strapi provider spec (`strapi-provider-upload-media`)
 - `upload`/`uploadStream`: **master** → `PUT {baseUrl}/{folder}/{hash}{ext}`; **responsive

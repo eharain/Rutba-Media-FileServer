@@ -20,8 +20,9 @@
  * (CACHE_MAX_BYTES) with least-recently-used eviction. Videos/SVG/non-raster stream
  * straight from disk with HTTP Range; never resized.
  *
- * Env: PORT HOST MASTER_DIR CACHE_DIR CACHE_MAX_BYTES IMAGE_QUALITY MAX_DIM
- *      VARIANTS CORS_ORIGIN UPLOAD_TOKEN
+ * Env: PORT HOST UPLOAD_DIR (aka MASTER_DIR/MEDIA_DIR) CACHE_DIR CACHE_MAX_BYTES
+ *      IMAGE_QUALITY MAX_DIM VARIANTS CORS_ORIGIN UPLOAD_TOKEN
+ *      (dir vars expand a leading `~`, e.g. UPLOAD_DIR=~/uploads/trustlist/)
  * Requires `sharp` (degrades to serving masters unresized if unavailable).
  */
 
@@ -29,16 +30,29 @@ const http = require('http');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 
 let sharp = null;
 try { sharp = require('sharp'); if (sharp.cache) sharp.cache(false); }
 catch { console.warn('[media] sharp unavailable — resize disabled, serving masters as-is. Run: npm install sharp'); }
 
+// Expand a leading `~` / `~/` to the OS home dir (Node does not do this itself),
+// so env like `UPLOAD_DIR=~/uploads/trustlist/` resolves correctly.
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~') return os.homedir();
+  if (p === '~/' || p === '~\\') return os.homedir() + path.sep;
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-const MASTER_DIR = path.resolve(process.env.MASTER_DIR || process.env.MEDIA_DIR || path.join(__dirname, 'public'));
-const CACHE_DIR = path.resolve(process.env.CACHE_DIR || path.join(__dirname, '.cache'));
+// Masters live here. Accept UPLOAD_DIR (and the legacy MASTER_DIR/MEDIA_DIR aliases);
+// the first one set wins. `~` is expanded.
+const MASTER_DIR = path.resolve(expandHome(process.env.MASTER_DIR || process.env.MEDIA_DIR || process.env.UPLOAD_DIR || path.join(__dirname, 'public')));
+const CACHE_DIR = path.resolve(expandHome(process.env.CACHE_DIR || path.join(__dirname, '.cache')));
 const CACHE_MAX_BYTES = parseInt(process.env.CACHE_MAX_BYTES, 10) || 1024 * 1024 * 1024;
 const CACHE_LOW_BYTES = Math.floor(CACHE_MAX_BYTES * 0.8);
 const DEFAULT_QUALITY = clampInt(process.env.IMAGE_QUALITY, 80, 1, 100);
