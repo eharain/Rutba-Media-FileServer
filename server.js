@@ -35,8 +35,11 @@ const fs = require('fs');
 const { loadConfig } = require('./src/config');
 const { createApp } = require('./src/app');
 
-// Start the server only when run directly (`node server.js`), not when required
-// as a module for embedding/testing.
+// Start the server when run directly (`node server.js`) OR when loaded by a
+// Passenger/LiteSpeed-lsnode host, which *require()s* the startup file rather
+// than running it as the main module (so `require.main === module` is false
+// there). lsnode sets LSNODE_ROOT / Passenger sets PASSENGER_BASE_URI. Plain
+// `require('./server.js')` for embedding/testing still does NOT auto-start.
 function start(config = loadConfig()) {
   const { server, cache, sharp } = createApp(config);
 
@@ -50,6 +53,6 @@ function start(config = loadConfig()) {
   return { server, cache };
 }
 
-if (require.main === module) start();
+if (require.main === module || process.env.LSNODE_ROOT || process.env.PASSENGER_BASE_URI) start();
 
 module.exports = { start, createApp, loadConfig };
