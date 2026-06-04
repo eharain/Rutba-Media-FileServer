@@ -6,6 +6,7 @@
  */
 
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Common headers on every response: permissive CORS (tunable), no MIME sniffing.
 function setCommon(res, corsOrigin) {
@@ -28,10 +29,14 @@ function send(res, code, msg) {
 function streamFile(req, res, filePath, type, stat) {
   const total = stat.size;
   const lastMod = stat.mtime.toUTCString();
-  // Strong validator from size + mtime (nginx/Express style). It survives CDNs
-  // that strip Last-Modified (Hostinger's hcdn does) and lets browsers/CDNs
-  // revalidate cheaply with a 304 — and gives the edge a validator to cache on.
-  const etag = '"' + total.toString(16) + '-' + Math.floor(stat.mtimeMs).toString(16) + '"';
+  // Strong validator that is STABLE across requests. We key it on the file's
+  // identity (path) + size rather than mtime, because the LRU cache "touches"
+  // (updates mtime of) a variant on every hit — an mtime-based ETag would change
+  // each request and never revalidate. Masters are content-hash-named by Strapi
+  // and variant cache files are content-addressed, so path+size uniquely and
+  // stably identifies the bytes. Survives CDNs that strip Last-Modified, and lets
+  // browsers/CDNs revalidate cheaply with a 304 + gives the edge a cache validator.
+  const etag = '"' + crypto.createHash('sha1').update(filePath).digest('hex').slice(0, 16) + '-' + total.toString(16) + '"';
   const base = {
     'Content-Type': type,
     'Accept-Ranges': 'bytes',
