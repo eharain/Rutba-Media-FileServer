@@ -27,12 +27,24 @@ function send(res, code, msg) {
 // honoring HEAD. Used for video seeking and for serving any on-disk file.
 function streamFile(req, res, filePath, type, stat) {
   const total = stat.size;
+  const lastMod = stat.mtime.toUTCString();
+  // Strong validator from size + mtime (nginx/Express style). It survives CDNs
+  // that strip Last-Modified (Hostinger's hcdn does) and lets browsers/CDNs
+  // revalidate cheaply with a 304 — and gives the edge a validator to cache on.
+  const etag = '"' + total.toString(16) + '-' + Math.floor(stat.mtimeMs).toString(16) + '"';
   const base = {
     'Content-Type': type,
     'Accept-Ranges': 'bytes',
     'Cache-Control': 'public, max-age=31536000, immutable',
-    'Last-Modified': stat.mtime.toUTCString(),
+    'Last-Modified': lastMod,
+    'ETag': etag,
   };
+  // Conditional GET -> 304 Not Modified (no body) when the validator still matches.
+  const inm = req.headers['if-none-match'];
+  const ims = req.headers['if-modified-since'];
+  const notModified = (inm && inm.split(',').some((t) => { const v = t.trim(); return v === etag || v === 'W/' + etag || v === '*'; }))
+    || (!inm && ims && Date.parse(ims) >= Date.parse(lastMod));
+  if (notModified) { res.writeHead(304, { 'Cache-Control': base['Cache-Control'], 'ETag': etag, 'Last-Modified': lastMod }); return res.end(); }
   const range = req.headers.range;
   if (range) {
     const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
