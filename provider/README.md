@@ -47,6 +47,10 @@ module.exports = ({ env }) => ({
         baseUrl: env('MEDIA_BASE_URL'),          // https://images.rutba.pk (or images.trustlist.uk)
         uploadToken: env('MEDIA_UPLOAD_TOKEN'),  // must equal the service's UPLOAD_TOKEN
         skipVariants: true,                      // recommended: store masters only
+        // optional, for the service's clustering: mark some uploads private so they
+        // stay on private/LAN nodes (sends X-Visibility: private). Either list
+        // folder prefixes, or supply visibility(key, file) -> 'private'|'public'|null.
+        privatePaths: ['private', 'secure'],
       },
       sizeLimit: env.int('UPLOAD_MAX_FILE_SIZE', 250 * 1024 * 1024),
     },
@@ -77,6 +81,10 @@ previews render in the admin:
 |---|---|
 | `MEDIA_BASE_URL` | Public base URL of the media service |
 | `MEDIA_UPLOAD_TOKEN` | Shared secret; equals the service `UPLOAD_TOKEN` |
+
+`providerOptions.privatePaths` (or a `visibility()` fn) is optional and only matters when the
+media service runs in a cluster — it tags matching masters `X-Visibility: private` so they
+replicate to private/LAN nodes only. See the service README "Clustering" section.
 
 ## How it maps to the service
 - `provider.upload(master)` → `PUT {baseUrl}/{hash}{ext}` (bytes stored).

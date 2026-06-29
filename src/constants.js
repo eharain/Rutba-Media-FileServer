@@ -24,4 +24,12 @@ const MASTER_EXTS = ['.jpg', '.jpeg', '.png', '.webp', '.avif', '.gif', '.tiff',
 // Requested output format → file extension for the cached variant.
 const FMT_EXT = { jpeg: '.jpg', jpg: '.jpg', png: '.png', webp: '.webp', avif: '.avif' };
 
-module.exports = { MIME, RASTER, FMT_EXT, MASTER_EXTS };
+// Cluster / visibility wire protocol (all HTTP header names are lower-case, matching
+// Node's req.headers). A master's visibility is recorded next to it in a small
+// sidecar file (`<master>.vis` containing "public"/"private") when set explicitly.
+const HDR_VISIBILITY = 'x-visibility';           // public | private (upload + replication)
+const HDR_CLUSTER_SECRET = 'x-cluster-secret';   // node-to-node auth (CLUSTER_SECRET)
+const HDR_CLUSTER_REPLICATED = 'x-cluster-replicated'; // "1" on a replicated write — receiver must NOT re-fan-out
+const SIDECAR_EXT = '.vis';                       // visibility sidecar suffix (kept internal, never served)
+
+module.exports = { MIME, RASTER, FMT_EXT, MASTER_EXTS, HDR_VISIBILITY, HDR_CLUSTER_SECRET, HDR_CLUSTER_REPLICATED, SIDECAR_EXT };

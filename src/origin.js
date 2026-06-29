@@ -12,12 +12,7 @@
  * so this is not a general SSRF surface. Disabled when `sources` is empty.
  */
 
-const fs = require('fs');
-const fsp = require('fs/promises');
-const path = require('path');
-const { Readable } = require('stream');
-const { pipeline } = require('stream/promises');
-const { pathHash } = require('./util');
+const { fetchAndStore } = require('./fetchstore');
 
 class OriginFetcher {
   constructor({ sources, masterDir, cacheDir, timeoutMs }) {
@@ -47,35 +42,12 @@ class OriginFetcher {
   }
 
   async _doFetch(rel) {
-    for (const base of this.sources) {
-      const url = base + '/' + encodeURI(rel);
-      let res;
-      try {
-        const ac = new AbortController();
-        const timer = setTimeout(() => ac.abort(), this.timeoutMs);
-        try { res = await fetch(url, { signal: ac.signal, redirect: 'follow' }); }
-        finally { clearTimeout(timer); }
-      } catch { continue; }
-      if (!res || !res.ok || !res.body) continue;
-
-      const dest = path.join(this.masterDir, rel);
-      const tmp = path.join(this.cacheDir, `origin.${process.pid}.${pathHash(rel)}.tmp`);
-      try {
-        await fsp.mkdir(this.cacheDir, { recursive: true });
-        await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(tmp));
-        await fsp.mkdir(path.dirname(dest), { recursive: true });
-        await fsp.rename(tmp, dest); // atomic publish into MASTER_DIR
-        const stat = await fsp.stat(dest);
-        console.log(`[media] origin: fetched ${rel} from ${base} (${(stat.size / 1024).toFixed(1)} KiB)`);
-        return { path: dest, rel, stat };
-      } catch (e) {
-        await fsp.unlink(tmp).catch(() => {});
-        // Could not persist (e.g. read-only MASTER_DIR) — treat as a miss.
-        console.warn(`[media] origin: failed to store ${rel} from ${base}: ${e && e.message || e}`);
-        continue;
-      }
-    }
-    return null;
+    const hit = await fetchAndStore({
+      bases: this.sources, rel, masterDir: this.masterDir, cacheDir: this.cacheDir,
+      timeoutMs: this.timeoutMs, label: 'origin',
+    });
+    if (hit) console.log(`[media] origin: fetched ${rel} from ${hit.base} (${(hit.stat.size / 1024).toFixed(1)} KiB)`);
+    return hit;
   }
 }
 

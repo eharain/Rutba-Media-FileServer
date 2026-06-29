@@ -51,6 +51,20 @@ function parseList(s) {
   return s.split(/[\s,]+/).map((x) => x.trim().replace(/\/+$/, '')).filter(Boolean);
 }
 
+// Parse CLUSTER_PEERS into [{ url, role }]. Each token is "<baseUrl>" or
+// "<baseUrl>|<role>" (role ∈ {public, private}, default public); trailing slashes
+// on the URL are stripped. Whitespace/comma separated.
+function parsePeers(s) {
+  if (!s) return [];
+  return s.split(/[\s,]+/).map((tok) => tok.trim()).filter(Boolean).map((tok) => {
+    const i = tok.lastIndexOf('|');
+    let url = tok, role = 'public';
+    if (i !== -1) { url = tok.slice(0, i); role = tok.slice(i + 1).toLowerCase(); }
+    url = url.replace(/\/+$/, '');
+    return { url, role: role === 'private' ? 'private' : 'public' };
+  }).filter((p) => p.url);
+}
+
 // Swap an extension on a path's basename. swapExt('a/b.webp', '.jpg') -> 'a/b.jpg'.
 function swapExt(p, ext) {
   const dir = path.dirname(p);
@@ -81,4 +95,4 @@ function relOf(root, abs) {
   return path.relative(root, abs).replace(/\\/g, '/');
 }
 
-module.exports = { userHome, expandHome, clampInt, parseVariants, parseList, swapExt, pathHash, resolveSafe, relOf };
+module.exports = { userHome, expandHome, clampInt, parseVariants, parseList, parsePeers, swapExt, pathHash, resolveSafe, relOf };

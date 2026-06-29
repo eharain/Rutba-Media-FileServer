@@ -9,7 +9,9 @@
  *      against the known master extensions (so `/small_x.webp` finds master `x.jpg`).
  *      Output keeps the MASTER's own format — extension-swap locates, it never
  *      transcodes (callers can still force a format with `?fm=`).
- *   3. Origin pull-through — if still missing and origins are configured, download
+ *   3. Cluster peers — if still missing and peers are configured, pull the master
+ *      from an eligible sibling node (per the master's visibility) and persist it.
+ *   4. Origin pull-through — if still missing and origins are configured, download
  *      the master (trying the same candidate rels) and persist it, then serve.
  *
  * Returns one of:
@@ -22,7 +24,8 @@
 const fsp = require('fs/promises');
 const path = require('path');
 const { resolveSafe, relOf, swapExt } = require('./util');
-const { MASTER_EXTS } = require('./constants');
+const { MASTER_EXTS, SIDECAR_EXT } = require('./constants');
+const { isPrivateRel } = require('./visibility');
 
 const statFile = (p) => fsp.stat(p).catch(() => null);
 
@@ -36,10 +39,18 @@ function candidateExts(reqExt) {
   return out;
 }
 
-function createMasterResolver({ config, origin }) {
-  const { masterDir, variantRe, variants } = config;
+function createMasterResolver({ config, origin, cluster }) {
+  const { masterDir, variantRe, variants, privatePaths } = config;
 
   return async function resolveMaster(reqRel, opts) {
+    // Visibility sidecars are an internal record, never directly served.
+    if (reqRel.endsWith(SIDECAR_EXT)) return { notFound: true };
+
+    // Path-derived visibility — the cross-node authority for which peers may hold
+    // this master (an explicit per-file override only travels with the bytes, so a
+    // not-yet-present master is classified by its path).
+    const visibility = isPrivateRel(reqRel, privatePaths) ? 'private' : 'public';
+
     // 1. Exact path.
     const exact = resolveSafe(masterDir, reqRel);
     if (!exact) return { forbidden: true };
@@ -69,7 +80,13 @@ function createMasterResolver({ config, origin }) {
       if (st && st.isFile()) return { masterPath: abs, stat: st };
     }
 
-    // 3. Origin pull-through.
+    // 3. Cluster peers (siblings) — pull from an eligible node for this visibility.
+    if (cluster && cluster.enabled) {
+      const got = await cluster.pull(candidates, visibility);
+      if (got && got.stat && got.stat.isFile()) return { masterPath: got.path, stat: got.stat };
+    }
+
+    // 4. Origin pull-through (external sources).
     if (origin && origin.enabled) {
       const got = await origin.fetchMaster(candidates);
       if (got && got.stat && got.stat.isFile()) return { masterPath: got.path, stat: got.stat };

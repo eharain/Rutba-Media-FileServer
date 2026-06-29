@@ -32,6 +32,9 @@ async function t(name, fn) { try { await fn(); ok(name); } catch (e) { bad(name,
 const status = async (u, o) => (await fetch(u, o)).status;
 const dim = async (u, o) => { const r = await fetch(u, o); const b = Buffer.from(await r.arrayBuffer()); const m = await sharp(b).metadata(); return { code: r.status, ...m, bytes: b.length, ct: r.headers.get('content-type') }; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Poll an async predicate until truthy (for fire-and-forget replication).
+const waitFor = async (fn, tries = 50, gap = 50) => { for (let i = 0; i < tries; i++) { try { if (await fn()) return true; } catch {} await sleep(gap); } return false; };
+const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((await fetch(base + '/_health')).ok) return; } catch {} await sleep(100); } };
 
 (async () => {
   const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
@@ -165,6 +168,71 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     } finally {
       srv2.kill();
       origin.close();
+    }
+  })();
+
+  // ── clustering (two sibling nodes: public + private/LAN) ───────────────────
+  await (async () => {
+    const PORT_PUB = 8733, PORT_PRV = 8734;
+    const BASE_PUB = `http://127.0.0.1:${PORT_PUB}`, BASE_PRV = `http://127.0.0.1:${PORT_PRV}`;
+    const M_PUB = path.join(tmp, 'mpub'), C_PUB = path.join(tmp, 'cpub');
+    const M_PRV = path.join(tmp, 'mprv'), C_PRV = path.join(tmp, 'cprv');
+    fs.mkdirSync(M_PUB, { recursive: true }); fs.mkdirSync(M_PRV, { recursive: true });
+    const SECRET = 'cluster-secret-xyz';
+    const img = await sharp({ create: { width: 800, height: 500, channels: 3, background: { r: 120, g: 200, b: 90 } } }).jpeg({ quality: 90 }).toBuffer();
+
+    // Public node lists the private node as a private peer; private node lists the public node.
+    const pub = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+      env: { ...process.env, PORT: String(PORT_PUB), HOST: '127.0.0.1', MASTER_DIR: M_PUB, CACHE_DIR: C_PUB, UPLOAD_TOKEN: TOKEN,
+        CLUSTER_ROLE: 'public', CLUSTER_SECRET: SECRET, CLUSTER_PEERS: `${BASE_PRV}|private`, PRIVATE_PATHS: 'private' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const prv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+      env: { ...process.env, PORT: String(PORT_PRV), HOST: '127.0.0.1', MASTER_DIR: M_PRV, CACHE_DIR: C_PRV, UPLOAD_TOKEN: TOKEN,
+        CLUSTER_ROLE: 'private', CLUSTER_SECRET: SECRET, CLUSTER_PEERS: `${BASE_PUB}|public`, PRIVATE_PATHS: 'private' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    pub.stderr.on('data', (d) => process.env.DEBUG && console.error('[pub]', d.toString()));
+    prv.stderr.on('data', (d) => process.env.DEBUG && console.error('[prv]', d.toString()));
+    await waitHealth(BASE_PUB); await waitHealth(BASE_PRV);
+
+    try {
+      // A public upload to the private/LAN node replicates UP to the public node.
+      await t('cluster: public master replicates private -> public', async () => {
+        const r = await fetch(`${BASE_PRV}/team/cover.jpg`, { method: 'PUT', headers: { Authorization: `Bearer ${TOKEN}` }, body: img });
+        assert.equal(r.status, 201);
+        const arrived = await waitFor(() => fs.existsSync(path.join(M_PUB, 'team/cover.jpg')));
+        assert.ok(arrived, 'master replicated to public node disk');
+        const d = await dim(`${BASE_PUB}/team/cover.jpg?w=200`); assert.equal(d.code, 200); assert.equal(d.width, 200);
+      });
+
+      // A private-visibility upload stays in the private zone — never sent to a public node.
+      await t('cluster: private master stays off public node', async () => {
+        const r = await fetch(`${BASE_PRV}/private/secret.jpg`, { method: 'PUT', headers: { Authorization: `Bearer ${TOKEN}` }, body: img });
+        assert.equal(r.status, 201);
+        await sleep(400); // give any (incorrect) replication a chance to land
+        assert.ok(!fs.existsSync(path.join(M_PUB, 'private/secret.jpg')), 'private master must NOT be on the public node');
+        assert.ok(fs.existsSync(path.join(M_PRV, 'private/secret.jpg')), 'private master present on the private node');
+        assert.equal(await status(`${BASE_PUB}/private/secret.jpg`), 404, 'public node refuses to serve/pull private master');
+      });
+
+      // Pull-on-miss: a master placed only on the public node is fetched by the private node.
+      await t('cluster: missing public master pulled from peer', async () => {
+        fs.writeFileSync(path.join(M_PUB, 'pullme.jpg'), img); // seed only on the public node, no replication
+        assert.ok(!fs.existsSync(path.join(M_PRV, 'pullme.jpg')), 'not on private node yet');
+        const d = await dim(`${BASE_PRV}/pullme.jpg?w=150`); assert.equal(d.code, 200); assert.equal(d.width, 150);
+        assert.ok(await waitFor(() => fs.existsSync(path.join(M_PRV, 'pullme.jpg'))), 'pulled master persisted locally');
+      });
+
+      // Node-to-node auth: the cluster secret authorizes a write; a wrong/absent one is rejected.
+      await t('cluster: X-Cluster-Secret authorizes write, bad secret 401', async () => {
+        const okR = await fetch(`${BASE_PUB}/viacluster.jpg`, { method: 'PUT', headers: { 'X-Cluster-Secret': SECRET, 'X-Cluster-Replicated': '1' }, body: img });
+        assert.equal(okR.status, 201);
+        const badR = await fetch(`${BASE_PUB}/nope.jpg`, { method: 'PUT', headers: { 'X-Cluster-Secret': 'wrong' }, body: img });
+        assert.equal(badR.status, 401);
+      });
+    } finally {
+      pub.kill(); prv.kill();
     }
   })();
 

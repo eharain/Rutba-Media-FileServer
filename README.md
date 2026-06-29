@@ -8,7 +8,7 @@ built for **Hostinger Node.js hosting** (Business Web Hosting, `77.37.37.27`) or
 > - `provider/` — Strapi upload provider (`strapi-provider-upload-media`)
 > - `migrate/` — DB-driven migration (masters-only + `formats` rewrite)
 > - `deploy/` — Dockerfile, compose, Caddy snippet, deploy guide
-> - `test/` — automated suite (`cd test && npm install && node test.js`) — 22/22 passing
+> - `test/` — automated suite (`cd test && npm install && node test.js`) — 26/26 passing
 > - `nextjs/` — optional `<Image>` custom loader for the drop-formats path
 
 **Why:** Strapi pre-generates `thumbnail_/small_/medium_/large_` variants for every
@@ -51,6 +51,45 @@ allow-list of base URLs is ever fetched, at traversal-safe paths.
 ORIGIN_SOURCES="https://bucket.s3.amazonaws.com https://old-strapi.example/uploads"
 ```
 
+## Clustering — share/replicate masters across nodes (optional)
+Run several nodes that **share master files** (resized variants are always regenerated
+locally on demand, never synced). Each node has a **role** and each file has a
+**visibility**, and one rule combines them:
+
+| | public master | private master |
+|---|---|---|
+| **stored / served / replicated to** | any node | `private`-role nodes only |
+
+- **`CLUSTER_ROLE`** = `public` (internet-facing) or `private` (local/LAN). A
+  public-zone node never replicates, accepts, or serves a private master.
+- **`CLUSTER_PEERS`** = the sibling nodes, each tagged with its role:
+  `CLUSTER_PEERS="https://images.rutba.pk|public http://nas.lan:3000|private"`.
+- **`CLUSTER_SECRET`** authenticates node-to-node traffic (separate from `UPLOAD_TOKEN`).
+
+What happens:
+- **Replicate on upload (masters only).** A fresh `PUT` fans the master out to the
+  peers eligible for its visibility. So a private/LAN node pushes its **public**
+  uploads *up* to the public node(s), while a **private** upload stays inside the
+  private/LAN zone. `DELETE` propagates the same way. (Replicated writes carry
+  `X-Cluster-Replicated:1` so receivers don't re-fan-out — no loops.)
+- **Pull on miss.** A node missing a master asks the peers eligible for that
+  visibility, persists the hit under `MASTER_DIR`, then serves it — e.g. a private
+  node fetches a public master from the public node on first request. Cluster peers
+  are tried **before** `ORIGIN_SOURCES`.
+
+**Visibility** is the request path by default — anything under a `PRIVATE_PATHS`
+prefix (e.g. `PRIVATE_PATHS="private secure/docs"`) is private. An `X-Visibility:
+private|public` header on upload overrides per file and is recorded in a sidecar
+(and carried to peers on replication). The path rule is the cross-node authority,
+so to keep a file private everywhere, place it under a `PRIVATE_PATHS` prefix.
+
+```
+# public, internet-facing node
+CLUSTER_ROLE=public  CLUSTER_SECRET=…  CLUSTER_PEERS="http://nas.lan:3000|private"
+# private/LAN node
+CLUSTER_ROLE=private CLUSTER_SECRET=…  CLUSTER_PEERS="https://images.rutba.pk|public" PRIVATE_PATHS="private"
+```
+
 ## Files
 ```
 server.js        # entrypoint — loads config, wires the app, starts listening (node>=18)
@@ -62,9 +101,12 @@ src/             # the media service, split for reuse/testing:
   http.js        #   CORS headers, plain responses, Range-aware streamFile
   cache.js       #   VariantCache — on-disk LRU (size cap + eviction)
   resizer.js     #   VariantResizer — resize-on-request + concurrency de-dupe
-  resolve.js     #   master resolver: exact → prefix+ext-swap → origin pull-through
+  resolve.js     #   master resolver: exact → prefix+ext-swap → cluster peers → origin
+  fetchstore.js  #   download-a-master-and-persist primitive (origin + cluster)
   origin.js      #   OriginFetcher — download a missing master from a source list
-  handlers/      #   read.js (GET/HEAD), write.js (PUT/DELETE, auth)
+  cluster.js     #   Cluster — replicate masters to peers + pull on miss (role/visibility)
+  visibility.js  #   public/private rules: PRIVATE_PATHS + X-Visibility sidecar
+  handlers/      #   read.js (GET/HEAD), write.js (PUT/DELETE, auth + replication)
   app.js         #   createApp(config) → { server, cache } (routing + wiring)
 package.json     # dep: sharp; `npm start` → node server.js
 public/          # MASTER_DIR by default — put ORIGINAL files here (gitignored)
@@ -115,6 +157,11 @@ curl -r 0-1023 -sD - -o /dev/null https://images.rutba.pk/<name>.mp4  # 206
 | `UPLOAD_MAX_BYTES` | `268435456` (256 MiB) | max PUT body; over → 413. Alias `SIZE_LIMIT`; `0` disables |
 | `ORIGIN_SOURCES` | (none) | space/comma-separated base URLs to pull a missing master from (then cache under `MASTER_DIR`). Empty → 404 on miss |
 | `ORIGIN_TIMEOUT_MS` | `10000` | per-request timeout for origin fetches |
+| `CLUSTER_ROLE` | `public` | this node's zone: `public` (internet-facing) or `private` (local/LAN). Gates which masters it replicates, accepts, and serves. Alias `NODE_VISIBILITY` |
+| `CLUSTER_PEERS` | (none) | sibling nodes, space/comma-separated; each `<baseUrl>` or `<baseUrl>\|<role>` (role `public`/`private`, default `public`). Empty → clustering off |
+| `CLUSTER_SECRET` | (none) | shared secret for node-to-node traffic (replication writes + private pulls). Distinct from `UPLOAD_TOKEN` |
+| `CLUSTER_TIMEOUT_MS` | `ORIGIN_TIMEOUT_MS` or `10000` | per-request timeout for peer pulls/replication |
+| `PRIVATE_PATHS` | (none) | space/comma-separated path prefixes whose masters are private (segment-aware). An `X-Visibility` header on upload overrides per file |
 | `CORS_ORIGIN` | `*` | restrict if desired |
 
 ## Migration / integration (next steps)

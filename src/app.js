@@ -18,6 +18,7 @@ const sharp = require('./sharp');
 const { VariantCache } = require('./cache');
 const { VariantResizer } = require('./resizer');
 const { OriginFetcher } = require('./origin');
+const { Cluster } = require('./cluster');
 const { createMasterResolver } = require('./resolve');
 const { createReadHandler } = require('./handlers/read');
 const { createWriteHandler } = require('./handlers/write');
@@ -27,9 +28,10 @@ function createApp(config) {
   const cache = new VariantCache(config);
   const resizer = new VariantResizer({ sharp, cache });
   const origin = new OriginFetcher({ sources: config.originSources, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.originTimeoutMs });
-  const resolveMaster = createMasterResolver({ config, origin });
+  const cluster = new Cluster({ role: config.clusterRole, peers: config.clusterPeers, secret: config.clusterSecret, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.clusterTimeoutMs });
+  const resolveMaster = createMasterResolver({ config, origin, cluster });
   const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster });
-  const handleWrite = createWriteHandler({ config, cache });
+  const handleWrite = createWriteHandler({ config, cache, cluster });
 
   const server = http.createServer(async (req, res) => {
     setCommon(res, config.corsOrigin);
@@ -50,7 +52,7 @@ function createApp(config) {
   });
   server.on('clientError', (err, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 
-  return { server, cache, resizer, origin, sharp };
+  return { server, cache, resizer, origin, cluster, sharp };
 }
 
 module.exports = { createApp };

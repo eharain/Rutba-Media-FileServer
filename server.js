@@ -41,13 +41,14 @@ const { createApp } = require('./src/app');
 // there). lsnode sets LSNODE_ROOT / Passenger sets PASSENGER_BASE_URI. Plain
 // `require('./server.js')` for embedding/testing still does NOT auto-start.
 function start(config = loadConfig()) {
-  const { server, cache, sharp } = createApp(config);
+  const { server, cache, cluster, sharp } = createApp(config);
 
   if (!fs.existsSync(config.masterDir)) console.warn(`[media] WARNING: MASTER_DIR missing: ${config.masterDir}`);
 
+  const clusterInfo = cluster.enabled ? `${config.clusterRole}, ${config.clusterPeers.length} peer(s)` : 'OFF';
   // Warm the cache index, then listen regardless of whether the scan succeeded.
   cache.init().finally(() => server.listen(config.port, config.host, () =>
-    console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, sharp ${sharp ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}`)
+    console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, sharp ${sharp ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}, cluster ${clusterInfo}`)
   ));
 
   return { server, cache };

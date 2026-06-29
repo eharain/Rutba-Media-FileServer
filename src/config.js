@@ -8,11 +8,13 @@
  * Env: PORT HOST UPLOAD_DIR (aka MASTER_DIR/MEDIA_DIR) CACHE_DIR CACHE_MAX_BYTES
  *      IMAGE_QUALITY MAX_DIM VARIANTS CORS_ORIGIN UPLOAD_TOKEN
  *      UPLOAD_MAX_BYTES (aka SIZE_LIMIT) ORIGIN_SOURCES ORIGIN_TIMEOUT_MS
+ *      CLUSTER_ROLE (aka NODE_VISIBILITY) CLUSTER_PEERS CLUSTER_SECRET
+ *      CLUSTER_TIMEOUT_MS PRIVATE_PATHS
  *      (dir vars expand a leading `~`, e.g. UPLOAD_DIR=~/uploads/trustlist/)
  */
 
 const path = require('path');
-const { expandHome, clampInt, parseVariants, parseList } = require('./util');
+const { expandHome, clampInt, parseVariants, parseList, parsePeers } = require('./util');
 
 // Project root (one level up from src/) — anchors the default master/cache dirs
 // so they resolve to <repo>/public and <repo>/.cache exactly as before.
@@ -56,6 +58,25 @@ function loadConfig(env = process.env) {
     // ORIGIN_SOURCES="https://bucket.s3.amazonaws.com https://old-strapi/uploads"
     originSources: parseList(env.ORIGIN_SOURCES),
     originTimeoutMs: parseInt(env.ORIGIN_TIMEOUT_MS, 10) || 10000,
+    // ── Clustering ────────────────────────────────────────────────────────────
+    // This node's role in the cluster. `public` = internet-facing; `private` =
+    // local/LAN. Drives which masters this node will replicate, accept, and pull:
+    // private (visibility) masters are confined to `private`-role nodes; public
+    // masters can live on any node. (NODE_VISIBILITY is an alias.)
+    clusterRole: (env.CLUSTER_ROLE || env.NODE_VISIBILITY || 'public').toLowerCase() === 'private' ? 'private' : 'public',
+    // Sibling nodes. Each entry is "<baseUrl>" or "<baseUrl>|<role>" (role
+    // defaults to `public`), whitespace/comma separated. e.g.
+    // CLUSTER_PEERS="https://images.rutba.pk|public http://nas.lan:3000|private"
+    clusterPeers: parsePeers(env.CLUSTER_PEERS),
+    // Shared secret for node-to-node traffic (replication writes + private pulls),
+    // distinct from the public UPLOAD_TOKEN. Empty = clustering effectively off
+    // for anything that needs auth.
+    clusterSecret: env.CLUSTER_SECRET || '',
+    clusterTimeoutMs: parseInt(env.CLUSTER_TIMEOUT_MS, 10) || parseInt(env.ORIGIN_TIMEOUT_MS, 10) || 10000,
+    // Path prefixes whose masters are private by default (segment-aware, leading
+    // slash optional). e.g. PRIVATE_PATHS="private secure/docs". An explicit
+    // X-Visibility header on upload overrides this per file.
+    privatePaths: parseList(env.PRIVATE_PATHS),
     variants,
     // Matches Strapi-style `<prefix>_<name>` request basenames (e.g. small_photo.jpg).
     variantRe: new RegExp('^(' + Object.keys(variants).join('|') + ')_(.+)$'),

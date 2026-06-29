@@ -39,6 +39,17 @@ module.exports = {
     if (!baseUrl) throw new Error('[upload-media] providerOptions.baseUrl (or MEDIA_BASE_URL) is required');
     if (!token) throw new Error('[upload-media] providerOptions.uploadToken (or MEDIA_UPLOAD_TOKEN) is required');
 
+    // Optional file visibility for the media service's clustering. Either supply a
+    // `visibility(key, file) -> 'private'|'public'|null` function, or list
+    // `privatePaths` (folder prefixes); a master whose key matches is uploaded with
+    // `X-Visibility: private`, confining it to private/LAN cluster nodes. Defaults
+    // to no header (the service falls back to its own PRIVATE_PATHS / public).
+    const privatePaths = (Array.isArray(options.privatePaths) ? options.privatePaths : [])
+      .map((s) => String(s).replace(/^\/+|\/+$/g, '')).filter(Boolean);
+    const visibilityOf = typeof options.visibility === 'function'
+      ? options.visibility
+      : (key) => (privatePaths.some((p) => key === p || key.startsWith(p + '/')) ? 'private' : null);
+
     const keyOf = (file) => {
       const folder = String(file.path || '').replace(/^\/+|\/+$/g, ''); // "/277" -> "277"
       return folder ? `${folder}/${file.hash}${file.ext}` : `${file.hash}${file.ext}`;
@@ -57,11 +68,14 @@ module.exports = {
       if (masterUrls.size > 5000) masterUrls.delete(masterUrls.keys().next().value);
     };
 
-    async function put(key, body, mime) {
+    async function put(key, body, mime, file) {
       const isStream = body && typeof body.pipe === 'function';
+      const headers = { Authorization: `Bearer ${token}`, 'Content-Type': mime || 'application/octet-stream' };
+      const vis = visibilityOf(key, file);
+      if (vis === 'private' || vis === 'public') headers['X-Visibility'] = vis;
       const res = await fetch(urlOf(key), {
         method: 'PUT',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': mime || 'application/octet-stream' },
+        headers,
         body,
         ...(isStream ? { duplex: 'half' } : {}),
       });
@@ -88,7 +102,7 @@ module.exports = {
         file.url = variantUrl(file); // not stored — resized from the master on request
         return;
       }
-      await put(keyOf(file), body, file.mime);
+      await put(keyOf(file), body, file.mime, file);
       file.url = urlOf(keyOf(file));
       rememberMaster(file);
     }
