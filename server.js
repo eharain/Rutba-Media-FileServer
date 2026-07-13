@@ -41,17 +41,19 @@ const { createApp } = require('./src/app');
 // there). lsnode sets LSNODE_ROOT / Passenger sets PASSENGER_BASE_URI. Plain
 // `require('./server.js')` for embedding/testing still does NOT auto-start.
 function start(config = loadConfig()) {
-  const { server, cache, cluster, sharp } = createApp(config);
+  const { server, cache, cluster, db, ffmpeg, storage, sharp } = createApp(config);
 
   if (!fs.existsSync(config.masterDir)) console.warn(`[media] WARNING: MASTER_DIR missing: ${config.masterDir}`);
 
   const clusterInfo = cluster.enabled ? `${config.clusterRole}, ${config.clusterPeers.length} peer(s)` : 'OFF';
-  // Warm the cache index, then listen regardless of whether the scan succeeded.
-  cache.init().finally(() => server.listen(config.port, config.host, () =>
-    console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, sharp ${sharp ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}, cluster ${clusterInfo}`)
+  const volInfo = storage.multi ? `${storage.volumes.length} volumes (${config.storagePlacement})` : '1 volume';
+  // Warm the cache index, bring up the optional DB layer, and probe ffmpeg
+  // (best-effort — failures log and leave the feature off), then listen regardless.
+  Promise.allSettled([cache.init(), db.init(), ffmpeg.ready]).then(() => server.listen(config.port, config.host, () =>
+    console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, storage ${volInfo}, sharp ${sharp ? 'on' : 'OFF'}, ffmpeg ${ffmpeg.enabled ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}, cluster ${clusterInfo}, db ${db.enabled ? 'on' : 'OFF'}`)
   ));
 
-  return { server, cache };
+  return { server, cache, db };
 }
 
 if (require.main === module || process.env.LSNODE_ROOT || process.env.PASSENGER_BASE_URI) start();

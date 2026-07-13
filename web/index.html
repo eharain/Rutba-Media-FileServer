@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rutba Media Console</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%97%82%EF%B8%8F%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/_ui/styles.css">
+</head>
+<body>
+  <!-- Login / bootstrap view -->
+  <div id="auth" class="auth hidden">
+    <form id="auth-form" class="auth-card" autocomplete="on">
+      <div class="brand"><span class="brand-mark">🗂️</span><span>Rutba Media</span></div>
+      <h1 id="auth-title">Sign in</h1>
+      <p id="auth-sub" class="muted">Access the media console.</p>
+      <label>Email or username<input id="f-login" name="username" autocomplete="username" required></label>
+      <label id="f-email-wrap" class="hidden">Email<input id="f-email" name="email" type="email" autocomplete="email"></label>
+      <label>Password<input id="f-password" name="password" type="password" autocomplete="current-password" required></label>
+      <div id="auth-error" class="form-error hidden"></div>
+      <button id="auth-submit" type="submit" class="btn btn-primary btn-block">Sign in</button>
+      <p class="switch muted">
+        <span id="switch-text">First time here?</span>
+        <a href="#" id="switch-link">Create the admin account</a>
+      </p>
+    </form>
+  </div>
+
+  <!-- Main app shell -->
+  <div id="app" class="app hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">🗂️</span><span>Rutba Media</span></div>
+      <nav id="nav">
+        <a href="#/files" data-view="files" class="nav-item">📁 <span>Files</span></a>
+        <a href="#/upload" data-view="upload" class="nav-item">⬆️ <span>Upload</span></a>
+        <a href="#/shares" data-view="shares" class="nav-item">🔗 <span>Shares</span></a>
+        <a href="#/users" data-view="users" class="nav-item nav-admin">👥 <span>Users</span></a>
+        <a href="#/audit" data-view="audit" class="nav-item nav-admin">📜 <span>Audit</span></a>
+      </nav>
+      <div class="sidebar-foot">
+        <button type="button" id="theme-toggle" class="btn btn-ghost btn-sm" title="Toggle theme">🌓 Theme</button>
+        <div class="who">
+          <div class="who-name" id="who-name">—</div>
+          <div class="who-role muted" id="who-role"></div>
+        </div>
+        <button type="button" id="logout" class="btn btn-ghost btn-sm">Sign out</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button type="button" id="menu-btn" class="btn btn-ghost btn-sm mobile-only">☰</button>
+        <h2 id="view-title">Files</h2>
+        <div class="spacer"></div>
+        <div id="stat-strip" class="stat-strip"></div>
+      </header>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+
+  <!-- Preview modal -->
+  <div id="modal" class="modal hidden">
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-body" id="modal-body"></div>
+  </div>
+
+  <div id="toasts" class="toasts"></div>
+
+  <script src="/_ui/app.js"></script>
+</body>
+</html>

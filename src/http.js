@@ -24,6 +24,41 @@ function send(res, code, msg) {
   res.end(msg);
 }
 
+// JSON response. `extraHeaders` lets callers add Set-Cookie etc.
+function sendJson(res, code, obj, extraHeaders) {
+  const body = JSON.stringify(obj);
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', ...(extraHeaders || {}) });
+  res.end(body);
+}
+
+// Read and JSON-parse a request body, capped at `limit` bytes (default 1 MiB) so a
+// giant/mislabeled body can't exhaust memory. Resolves {} for an empty body;
+// rejects with err.statusCode 413 (too large) or 400 (invalid JSON).
+function readJson(req, limit = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) { const e = new Error('Payload Too Large'); e.statusCode = 413; req.destroy(); return reject(e); }
+      chunks.push(c);
+    });
+    req.on('error', reject);
+    req.on('end', () => {
+      if (!chunks.length) return resolve({});
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch { const e = new Error('Invalid JSON'); e.statusCode = 400; reject(e); }
+    });
+  });
+}
+
+// Best-effort client IP (honors a single X-Forwarded-For hop when behind a proxy).
+function clientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return (req.socket && req.socket.remoteAddress) || null;
+}
+
 // Stream a file with immutable caching + HTTP Range support (206 partial content),
 // honoring HEAD. Used for video seeking and for serving any on-disk file.
 function streamFile(req, res, filePath, type, stat) {
@@ -76,4 +111,4 @@ function streamFile(req, res, filePath, type, stat) {
   s.pipe(res);
 }
 
-module.exports = { setCommon, send, streamFile };
+module.exports = { setCommon, send, sendJson, readJson, clientIp, streamFile };

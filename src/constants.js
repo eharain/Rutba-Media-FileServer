@@ -30,6 +30,11 @@ const FMT_EXT = { jpeg: '.jpg', jpg: '.jpg', png: '.png', webp: '.webp', avif: '
 const HDR_VISIBILITY = 'x-visibility';           // public | private (upload + replication)
 const HDR_CLUSTER_SECRET = 'x-cluster-secret';   // node-to-node auth (CLUSTER_SECRET)
 const HDR_CLUSTER_REPLICATED = 'x-cluster-replicated'; // "1" on a replicated write — receiver must NOT re-fan-out
+// Fallback upload-auth header. Some front-ends (LiteSpeed/Apache/Passenger, e.g.
+// Hostinger) strip the standard `Authorization` header before it reaches the app,
+// which would 401 every write regardless of token. Accept the raw UPLOAD_TOKEN in
+// this custom header too — custom `X-` headers are passed through untouched.
+const HDR_UPLOAD_TOKEN = 'x-upload-token';        // = UPLOAD_TOKEN (Authorization-strip fallback)
 const SIDECAR_EXT = '.vis';                       // visibility sidecar suffix (kept internal, never served)
 
-module.exports = { MIME, RASTER, FMT_EXT, MASTER_EXTS, HDR_VISIBILITY, HDR_CLUSTER_SECRET, HDR_CLUSTER_REPLICATED, SIDECAR_EXT };
+module.exports = { MIME, RASTER, FMT_EXT, MASTER_EXTS, HDR_VISIBILITY, HDR_CLUSTER_SECRET, HDR_CLUSTER_REPLICATED, HDR_UPLOAD_TOKEN, SIDECAR_EXT };
