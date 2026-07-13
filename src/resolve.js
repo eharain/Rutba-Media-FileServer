@@ -15,19 +15,21 @@
  *      the master (trying the same candidate rels) and persist it, then serve.
  *
  * Returns one of:
- *   { masterPath, stat }   resolved
- *   { forbidden: true }    path escaped MASTER_DIR
- *   { notFound: true }     nothing matched
+ *   { masterPath, stat, rel }   resolved (rel = volume-independent URL key)
+ *   { forbidden: true }         path escaped MASTER_DIR
+ *   { notFound: true }          nothing matched
  * and may set `opts.w` to the variant width when a prefix matched.
+ *
+ * The local disk checks (1, 2) search every configured storage volume (default
+ * first) via `storage`, so masters spread across mounts all resolve. `rel` is
+ * returned so the caller keys the variant cache on the URL path, not the physical
+ * volume it happened to land on.
  */
 
-const fsp = require('fs/promises');
 const path = require('path');
 const { resolveSafe, relOf, swapExt } = require('./util');
 const { MASTER_EXTS, SIDECAR_EXT } = require('./constants');
 const { isPrivateRel } = require('./visibility');
-
-const statFile = (p) => fsp.stat(p).catch(() => null);
 
 // Requested extension first (so an exact-format master is preferred), then the
 // rest of the known master extensions, de-duplicated.
@@ -39,7 +41,7 @@ function candidateExts(reqExt) {
   return out;
 }
 
-function createMasterResolver({ config, origin, cluster }) {
+function createMasterResolver({ config, storage, origin, cluster }) {
   const { masterDir, variantRe, variants, privatePaths } = config;
 
   return async function resolveMaster(reqRel, opts) {
@@ -51,11 +53,12 @@ function createMasterResolver({ config, origin, cluster }) {
     // not-yet-present master is classified by its path).
     const visibility = isPrivateRel(reqRel, privatePaths) ? 'private' : 'public';
 
-    // 1. Exact path.
+    // 1. Exact path (across all volumes).
     const exact = resolveSafe(masterDir, reqRel);
     if (!exact) return { forbidden: true };
-    const exactStat = await statFile(exact);
-    if (exactStat && exactStat.isFile()) return { masterPath: exact, stat: exactStat };
+    const exactRel = relOf(masterDir, exact);
+    const exactHit = await storage.resolveRead(exactRel);
+    if (exactHit) return { masterPath: exactHit.abs, stat: exactHit.stat, rel: exactRel };
 
     // Build the ordered list of candidate master rels (used for disk and origin).
     const candidates = [];
@@ -70,26 +73,25 @@ function createMasterResolver({ config, origin, cluster }) {
       }
       if (!opts.w) opts.w = variants[vm[1]]; // variant width (even if we go to origin)
     } else {
-      candidates.push(relOf(masterDir, exact)); // direct request: master IS this path
+      candidates.push(exactRel); // direct request: master IS this path
     }
 
-    // 2. Extension-swap on disk.
+    // 2. Extension-swap across volumes.
     for (const rel of candidates) {
-      const abs = resolveSafe(masterDir, rel);
-      const st = abs ? await statFile(abs) : null;
-      if (st && st.isFile()) return { masterPath: abs, stat: st };
+      const hit = await storage.resolveRead(rel);
+      if (hit) return { masterPath: hit.abs, stat: hit.stat, rel };
     }
 
     // 3. Cluster peers (siblings) — pull from an eligible node for this visibility.
     if (cluster && cluster.enabled) {
       const got = await cluster.pull(candidates, visibility);
-      if (got && got.stat && got.stat.isFile()) return { masterPath: got.path, stat: got.stat };
+      if (got && got.stat && got.stat.isFile()) return { masterPath: got.path, stat: got.stat, rel: relOf(masterDir, got.path) };
     }
 
     // 4. Origin pull-through (external sources).
     if (origin && origin.enabled) {
       const got = await origin.fetchMaster(candidates);
-      if (got && got.stat && got.stat.isFile()) return { masterPath: got.path, stat: got.stat };
+      if (got && got.stat && got.stat.isFile()) return { masterPath: got.path, stat: got.stat, rel: relOf(masterDir, got.path) };
     }
 
     return { notFound: true };

@@ -70,7 +70,10 @@ module.exports = {
 
     async function put(key, body, mime, file) {
       const isStream = body && typeof body.pipe === 'function';
-      const headers = { Authorization: `Bearer ${token}`, 'Content-Type': mime || 'application/octet-stream' };
+      // Send the token both ways: Authorization for Caddy-fronted nodes, and the
+      // X-Upload-Token fallback for front-ends that strip Authorization
+      // (LiteSpeed/Passenger, e.g. Hostinger) — otherwise every write 401s.
+      const headers = { Authorization: `Bearer ${token}`, 'X-Upload-Token': token, 'Content-Type': mime || 'application/octet-stream' };
       const vis = visibilityOf(key, file);
       if (vis === 'private' || vis === 'public') headers['X-Visibility'] = vis;
       const res = await fetch(urlOf(key), {
@@ -115,7 +118,7 @@ module.exports = {
       async delete(file) {
         const key = keyOf(file);
         try {
-          await fetch(urlOf(key), { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+          await fetch(urlOf(key), { method: 'DELETE', headers: { Authorization: `Bearer ${token}`, 'X-Upload-Token': token } });
         } catch (e) {
           // best-effort; deleting the master purges its cached variants on the service
         }

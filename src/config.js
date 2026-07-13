@@ -38,13 +38,32 @@ function loadConfig(env = process.env) {
   const sizeLimitNum = parseInt(sizeLimitRaw, 10);
   const uploadMaxBytes = Number.isNaN(sizeLimitNum) ? DEFAULT_UPLOAD_MAX_BYTES : sizeLimitNum;
 
+  // Masters live here. Accept UPLOAD_DIR (and the legacy MASTER_DIR/MEDIA_DIR
+  // aliases); the first one set wins. `~` is expanded.
+  const masterDir = path.resolve(expandHome(env.MASTER_DIR || env.MEDIA_DIR || env.UPLOAD_DIR || path.join(ROOT, 'public')));
+
   return {
     port: parseInt(env.PORT, 10) || 3000,
     host: env.HOST || '0.0.0.0',
-    // Masters live here. Accept UPLOAD_DIR (and the legacy MASTER_DIR/MEDIA_DIR
-    // aliases); the first one set wins. `~` is expanded.
-    masterDir: path.resolve(expandHome(env.MASTER_DIR || env.MEDIA_DIR || env.UPLOAD_DIR || path.join(ROOT, 'public'))),
+    masterDir,
     cacheDir: path.resolve(expandHome(env.CACHE_DIR || path.join(ROOT, '.cache'))),
+    // Deleted masters are moved here (Trash & Recovery) instead of being unlinked,
+    // when the DB layer is on. Kept a sibling of masterDir (same volume → atomic
+    // rename) but OUTSIDE it, so trashed bytes are never servable. Override with
+    // TRASH_DIR. With no DB the trash is unused and DELETE hard-unlinks as before.
+    trashDir: path.resolve(expandHome(env.TRASH_DIR || path.join(path.dirname(masterDir), '.media-trash'))),
+    // ── Multi-volume storage (optional) ─────────────────────────────────────────
+    // Masters may be spread across several directories / mounts. `masterDir` is
+    // always volume `default` (first); extra volumes come from STORAGE_VOLUMES,
+    // each "id:path" or "id:path|ro" (read-only), whitespace/comma separated. e.g.
+    //   STORAGE_VOLUMES="disk2:/mnt/disk2 archive:/mnt/archive|ro"
+    // Reads search every volume (default first); new uploads are placed per
+    // STORAGE_PLACEMENT: `free` (most free space, default) | `fill` (first with
+    // room) | `route` (STORAGE_ROUTES prefix rules, e.g. "archive/=archive").
+    // With no extra volumes this is a single-volume system — identical to before.
+    storageVolumes: buildVolumes(env, masterDir),
+    storagePlacement: ['fill', 'route'].includes((env.STORAGE_PLACEMENT || '').toLowerCase()) ? env.STORAGE_PLACEMENT.toLowerCase() : 'free',
+    storageRoutes: parseRoutes(env.STORAGE_ROUTES),
     cacheMaxBytes,
     cacheLowBytes: Math.floor(cacheMaxBytes * 0.8), // evict down to ~80% when full
     defaultQuality: clampInt(env.IMAGE_QUALITY, 80, 1, 100),
@@ -80,6 +99,95 @@ function loadConfig(env = process.env) {
     variants,
     // Matches Strapi-style `<prefix>_<name>` request basenames (e.g. small_photo.jpg).
     variantRe: new RegExp('^(' + Object.keys(variants).join('|') + ')_(.+)$'),
+    // ── Database (optional) ─────────────────────────────────────────────────────
+    // Enables the accounts / RBAC / metadata / sharing / audit layer. When no DB
+    // host is configured, `db` is null and the server runs EXACTLY as before:
+    // public reads, token-gated writes, no user layer. MYSQL_* aliases DB_* so
+    // either naming works. Set DB_HOST (or MYSQL_HOST) to turn the layer on.
+    db: buildDbConfig(env),
+    // Read authorization mode (only consulted when `db` is set):
+    //   public (default) — reads are open to everyone, exactly as today
+    //   mixed            — public-visibility files open; private files need auth+permission
+    //   private          — every read needs an authenticated, permitted user
+    readAuthMode: ['mixed', 'private'].includes((env.READ_AUTH_MODE || '').toLowerCase())
+      ? env.READ_AUTH_MODE.toLowerCase() : 'public',
+    // Allow open self-service account registration via POST /_api/auth/register.
+    // The very first account is always allowed (bootstrap admin) regardless; after
+    // that, registration requires this flag (else an admin must create accounts).
+    allowRegistration: /^(1|true|yes|on)$/i.test(env.ALLOW_REGISTRATION || ''),
+    // Session lifetime (days) for issued login tokens.
+    sessionTtlDays: parseInt(env.SESSION_TTL_DAYS, 10) || 30,
+    // WebDAV mount at /_dav/ (needs the DB layer for accounts). On by default when
+    // the DB layer is up; set WEBDAV_ENABLED/WEBDAV to 0/false/off to disable.
+    webdavEnabled: !/^(0|false|off|no)$/i.test(env.WEBDAV_ENABLED || env.WEBDAV || ''),
+  };
+}
+
+// Build the storage volume list. `default` (masterDir) is always first; extra
+// volumes are parsed from STORAGE_VOLUMES ("id:path" or "id:path|ro"). Duplicate
+// ids and a volume equal to masterDir are skipped.
+function buildVolumes(env, masterDir) {
+  const vols = [{ id: 'default', dir: masterDir, readOnly: false }];
+  const seenId = new Set(['default']);
+  const seenDir = new Set([masterDir]);
+  const raw = env.STORAGE_VOLUMES;
+  if (raw) {
+    for (const tok of raw.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean)) {
+      let spec = tok, readOnly = false;
+      const bar = spec.lastIndexOf('|');
+      if (bar !== -1) { readOnly = /^ro$/i.test(spec.slice(bar + 1)); spec = spec.slice(0, bar); }
+      const colon = spec.indexOf(':');
+      // Keep Windows drive letters intact (e.g. d2:D:\media) — split on the FIRST
+      // colon only when what follows isn't a drive-letter path.
+      let id, dir;
+      if (colon > 0) { id = spec.slice(0, colon); dir = spec.slice(colon + 1); }
+      else { id = spec; dir = spec; }
+      id = id.trim(); dir = path.resolve(expandHome(dir.trim()));
+      if (!id || !dir || seenId.has(id) || seenDir.has(dir)) continue;
+      seenId.add(id); seenDir.add(dir);
+      vols.push({ id, dir, readOnly });
+    }
+  }
+  return vols;
+}
+
+// Parse STORAGE_ROUTES ("prefix=volumeId prefix2=volumeId2") into rules sorted by
+// prefix length (longest match wins).
+function parseRoutes(s) {
+  if (!s) return [];
+  return s.split(/[\s,]+/).map((t) => t.trim()).filter(Boolean).map((t) => {
+    const i = t.indexOf('=');
+    if (i === -1) return null;
+    return { prefix: t.slice(0, i).replace(/^\/+/, ''), volumeId: t.slice(i + 1) };
+  }).filter((r) => r && r.prefix && r.volumeId).sort((a, b) => b.prefix.length - a.prefix.length);
+}
+
+// Assemble the DB connection config, or null when unconfigured (feature off).
+// Accepts DB_* with MYSQL_* aliases; a bare DB_URL / MYSQL_URL is also honored.
+function buildDbConfig(env) {
+  const url = env.DB_URL || env.MYSQL_URL || env.DATABASE_URL;
+  if (url) {
+    try {
+      const u = new URL(url);
+      return {
+        host: u.hostname,
+        port: parseInt(u.port, 10) || 3306,
+        user: decodeURIComponent(u.username || 'root'),
+        password: decodeURIComponent(u.password || ''),
+        database: u.pathname.replace(/^\//, '') || 'media',
+        connectionLimit: parseInt(env.DB_POOL, 10) || 10,
+      };
+    } catch { /* fall through to discrete vars */ }
+  }
+  const host = env.DB_HOST || env.MYSQL_HOST;
+  if (!host) return null;
+  return {
+    host,
+    port: parseInt(env.DB_PORT || env.MYSQL_PORT, 10) || 3306,
+    user: env.DB_USER || env.MYSQL_USER || 'root',
+    password: env.DB_PASSWORD || env.MYSQL_PASSWORD || env.DB_PASS || '',
+    database: env.DB_NAME || env.MYSQL_DATABASE || 'media',
+    connectionLimit: parseInt(env.DB_POOL, 10) || 10,
   };
 }
 
