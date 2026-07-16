@@ -4,7 +4,8 @@
   "description": "Strapi upload provider for the Rutba/TrustList standalone media service (masters-only, resize-on-request)",
   "main": "index.js",
   "license": "MIT",
-  "author": "Ejaz Arain <eharain@gmail.com>",
+  "author": "Ejaz Arain <eharain@yahoo.com> (https://tech-style.co)",
+  "homepage": "https://tech-style.co",
   "keywords": [
     "strapi",
     "strapi-provider",
