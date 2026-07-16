@@ -157,7 +157,7 @@ public/          # MASTER_DIR by default — put ORIGINAL files here (gitignored
 provider/        # Strapi upload provider (strapi-provider-upload-media)
 migrate/         # DB-driven migration (mysql2/pg)
 deploy/          # Dockerfile, compose, Caddy snippet, deploy guide
-test/            # automated suite (17 checks)
+test/            # automated suite (26 checks)
 nextjs/          # optional <Image> loader
 ```
 > `server.js` + `src/` are both required at deploy time (e.g. the Dockerfile copies
@@ -168,7 +168,7 @@ nextjs/          # optional <Image> loader
 ## Develop & test
 ```bash
 npm install            # installs sharp at the repo root (the server needs it)
-npm test               # runs the 22-check suite (installs test deps first)
+npm test               # runs the 26-check suite (installs test deps first)
 ```
 > The suite spawns `server.js` as its own process, which resolves `sharp` from the
 > **repo root**, so `npm install` at the root is required before `npm test`
@@ -214,3 +214,7 @@ curl -r 0-1023 -sD - -o /dev/null https://images.rutba.pk/<name>.mp4  # 206
 - Point the apps' image origin at this host (`NEXT_PUBLIC_IMAGE_URL=https://images.rutba.pk`,
   Strapi upload `PUBLIC_URL`/provider) so `…/uploads/small_x.jpg` and `?w=` both resolve here.
 - Optionally disable Strapi's responsive-breakpoint generation so new uploads store the master only.
+
+## License & ownership
+MIT-licensed. Copyright © 2026 Ejaz Arain — [tech-style.co](https://tech-style.co).
+Maintainer: Ejaz Arain &lt;eharain@yahoo.com&gt;. See [LICENSE](LICENSE).
