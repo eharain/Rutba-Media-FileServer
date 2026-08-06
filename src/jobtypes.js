@@ -18,12 +18,23 @@
 const path = require('path');
 const { RASTER, MIME } = require('./constants');
 const { normalizeMetadata, normalizeProbe } = require('./metadata');
+const { pathKey } = require('./util');
+const { fromObject } = require('./handlers/filequery');
+
+// Tags are normalized identically wherever they are written — trimmed, lowercased,
+// deduped, length-capped — so a bulk tag and a single tag produce the same rows.
+function normalizeTags(names) {
+  return [...new Set((Array.isArray(names) ? names : [names])
+    .filter((x) => x != null)
+    .map((tName) => String(tName).trim().toLowerCase())
+    .filter((tName) => tName && tName.length <= 64))];
+}
 
 // How often the housekeeping sweep runs. Short enough that an expired session is
 // gone within the hour, long enough to be invisible.
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 
-function registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db = null }) {
+function registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db = null, masterops = null }) {
   // Registration is deliberately unconditional on `jobs.enabled`: wiring happens in
   // createApp, but the database only comes up later in db.init(), so gating here
   // would leave every handler unregistered and the worker with nothing to claim.
@@ -74,6 +85,76 @@ function registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config
     // Nothing this build can extract (a PDF without a reader, an unknown type…).
     return { path: rel, kind: 'other', extracted: false };
   }, { leaseSeconds: 300 });
+
+  // ── bulk ────────────────────────────────────────────────────────────────────
+  // Apply one action to every asset matching a filter. Anything above a few hundred
+  // assets has no business on the request path, and the queue already supplies the
+  // progress, cancellation and retry this needs.
+  if (db) {
+    jobs.register('bulk', async (payload, ctx) => {
+      const { clause, args } = fromObject(payload.filter || {});
+      const rows = await db.query(`SELECT id, path FROM files ${clause} ORDER BY id`, args);
+      const total = rows.length;
+      const out = { action: payload.action, matched: total, applied: 0, skipped: 0 };
+      const p = payload.params || {};
+
+      for (let i = 0; i < rows.length; i++) {
+        if (i % 50 === 0) {
+          if (await ctx.cancelled()) return { ...out, cancelled: true };
+          await ctx.heartbeat({ done: i, total });
+        }
+        const file = rows[i];
+        try {
+          switch (payload.action) {
+            case 'tag': await addTags(file.id, p.tags); break;
+            case 'untag': await removeTags(file.id, p.tags); break;
+            case 'collection_add':
+              await db.query('INSERT IGNORE INTO collection_files (collection_id, file_id, added_by) VALUES (?, ?, ?)',
+                [Number(p.collection_id), file.id, payload.userId || null]);
+              break;
+            case 'collection_remove':
+              await db.query('DELETE FROM collection_files WHERE collection_id = ? AND file_id = ?', [Number(p.collection_id), file.id]);
+              break;
+            case 'delete':
+              // Trash-aware: the same path a single DELETE takes, so a bulk delete is
+              // just as recoverable as an individual one.
+              await masterops.deleteMaster(file.path, { meta: { userId: payload.userId || null } });
+              break;
+            case 'extract':
+            case 'enrich':
+              await jobs.enqueue(payload.action, { path: file.path }, {
+                dedupeKey: `${payload.action}:${pathKey(file.path)}`, priority: 7,
+              });
+              break;
+            default:
+              out.skipped++;
+              continue;
+          }
+          out.applied++;
+        } catch (e) {
+          out.skipped++;
+          out.lastError = String(e.message || e).slice(0, 300);
+        }
+      }
+      ctx.log(`bulk ${payload.action}: ${out.applied}/${total} applied`);
+      return out;
+    }, { leaseSeconds: 900 });
+
+    // Tag helpers, shared by the tag/untag actions.
+    var addTags = async (fileId, names) => {
+      for (const raw of normalizeTags(names)) {
+        await db.query('INSERT IGNORE INTO tags (name) VALUES (?)', [raw]);
+        const tag = await db.one('SELECT id FROM tags WHERE name = ?', [raw]);
+        if (tag) await db.query('INSERT IGNORE INTO file_tags (file_id, tag_id) VALUES (?, ?)', [fileId, tag.id]);
+      }
+    };
+    var removeTags = async (fileId, names) => {
+      for (const raw of normalizeTags(names)) {
+        await db.query(
+          'DELETE ft FROM file_tags ft JOIN tags t ON t.id = ft.tag_id WHERE ft.file_id = ? AND t.name = ?', [fileId, raw]);
+      }
+    };
+  }
 
   // ── sweep ───────────────────────────────────────────────────────────────────
   // Housekeeping. Sessions were only ever removed on logout or on the next touch of

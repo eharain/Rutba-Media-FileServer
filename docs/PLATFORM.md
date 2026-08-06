@@ -152,6 +152,23 @@ namespace never collides with media paths (like `/_health`).
 | `GET  /_api/jobs/:id` | admin | One job with its progress/result |
 | `POST /_api/jobs/:id/cancel` | admin | Cancel a queued or running job |
 | `POST /_api/jobs/:id/retry` | admin | Re-queue a finished job with attempts reset |
+| `GET  /_api/files/versions?path=` | any user | Retained copies of a master + the retention policy |
+| `GET  /_api/files/versions/:n?path=` | any user | Download one retained version |
+| `POST /_api/files/versions/restore` | editor | Make a version live again `{path, version}` |
+| `DELETE /_api/files/versions/:n?path=` | editor | Delete one retained version |
+| `GET/PUT /_api/files/fields` | any user / editor | Custom metadata values for a file |
+| `GET  /_api/folders` | any user | Folder rows (`?parent=` to scope) |
+| `POST /_api/folders/sync` | editor | Materialize folder rows from the indexed paths |
+| `POST /_api/folders/move` | editor | Move/rename a subtree `{path, to}` |
+| `GET/POST /_api/collections` | any user / editor | List / create collections |
+| `DELETE /_api/collections/:id` | editor | Delete a collection (files untouched) |
+| `GET/POST /_api/collections/:id/files` | any user / editor | List members / `{add:[], remove:[]}` by path |
+| `GET/POST /_api/fields` · `DELETE /_api/fields/:id` | any user / admin | Custom field definitions |
+| `GET/POST /_api/renditions` · `DELETE /_api/renditions/:name` | any user / admin | Named resize presets |
+| `GET/POST /_api/searches` · `DELETE /_api/searches/:id` | bearer | Saved filter sets |
+| `POST /_api/bulk` | editor | Apply an action to everything matching a filter, as a job |
+| `GET/POST /_api/comments` · `PATCH`/`DELETE /_api/comments/:id` | bearer | Per-asset discussion |
+| `GET  /_api/notifications` · `POST /_api/notifications/read` | bearer | In-app notifications |
 
 ¹ First account always allowed; subsequent self-registration needs `ALLOW_REGISTRATION=true`.
 
@@ -245,6 +262,54 @@ owner and keeps every row, its tags and its shares; `?files=reassign&to=<id>`
 transfers ownership, and with it the bytes counted against that user's quota. The
 last active admin cannot be disabled, demoted or deleted — an installation with no
 admin cannot make one.
+
+## Managing the library
+
+Once every asset has a row, those rows become manageable as a library rather than a
+file listing.
+
+**Versions.** A `PUT` over an existing master used to destroy the previous bytes.
+Now the outgoing copy is moved aside *before* the new one lands — the same discipline
+as the trash, and stored beside it under `<TRASH_DIR>/versions`, outside every served
+volume so a retained copy is never reachable at its original URL. Restoring a version
+retains the current bytes first, so a restore is itself undoable. Retention is capped
+by count (`VERSION_RETAIN_COUNT`, default 3) and optionally age
+(`VERSION_RETAIN_DAYS`); an uncapped version store is a disk leak with good
+intentions. Replicated writes from a cluster peer are excluded — the originating node
+already kept the history, and duplicating it per node multiplies the cost by the size
+of the cluster.
+
+**Folders** are real rows now, not just path prefixes. `POST /_api/folders/sync`
+materializes them from the paths already indexed, and `POST /_api/folders/move`
+renames or moves a whole subtree through the same `masterops` WebDAV uses — so
+placement, indexing, cache purge and replication behave identically to any other
+write.
+
+**Collections** are sets that cut across paths — a campaign, a client, a release. An
+asset lives in exactly one folder and belongs to any number of collections, which is
+the whole reason both exist.
+
+**Custom metadata** lets an installation model its own taxonomy: define fields
+(`text`, `number`, `date`, `enum`, `multi`, `bool`), set values per asset, and filter
+on them with `?field=<key>&field_value=<v>` alongside the built-in filters. Values are
+written to the column their type deserves, so a date filter is a date comparison.
+
+**Named renditions** replace a memorized query string: `?rendition=web-hero` instead
+of `?w=1600&h=900&fit=cover&q=82&fm=webp`. Pure metadata over the resize engine that
+already exists — retune the definition later and every URL downstream teams shipped
+follows. An explicit query parameter still wins, so a rendition is a default, not a
+cage; an unknown name is a `404` rather than a silent full-size image.
+
+**Bulk operations** (`POST /_api/bulk`) apply `tag` / `untag` / `collection_add` /
+`collection_remove` / `delete` / `extract` / `enrich` to everything matching a filter,
+as a job. The filter is built by the *same* code that powers `GET /_api/files`
+(`handlers/filequery.js`) — deliberately, so the set you previewed is exactly the set
+that gets touched. Saved searches persist a filter set by name.
+
+**Comments** are threaded per asset and can be resolved. Posting one notifies the
+people already involved — the asset's owner and everyone who has commented on it —
+and nobody else, because a notification feed that includes the whole installation is
+useless within a week.
 
 ## Background jobs
 

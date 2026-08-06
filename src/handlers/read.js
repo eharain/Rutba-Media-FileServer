@@ -26,28 +26,36 @@ const FIT_VALUES = ['cover', 'contain', 'inside', 'outside', 'fill'];
 // unset — which is the default, and must stay free.
 const OPEN_GUARD = { enabled: false, checksBeforeResolve: false, async deny() { return null; } };
 
-function createReadHandler({ config, resizer, sharp, resolveMaster, media = null, readGuard = OPEN_GUARD }) {
+function createReadHandler({ config, resizer, sharp, resolveMaster, media = null, readGuard = OPEN_GUARD, renditions = null }) {
   // Parse resize options from the query string, clamped to safe ranges.
-  function parseOpts(req, q) {
-    const wq = clampInt(q.get('w'), 0, 1, config.maxDim);
-    const hq = clampInt(q.get('h'), 0, 1, config.maxDim);
-    let fm = (q.get('fm') || '').toLowerCase();
+  // A named rendition (`?rendition=web-hero`) supplies the same options from a
+  // stored preset, so downstream teams ask for a name instead of memorizing a query
+  // string — and the definition can be retuned without touching their URLs. An
+  // explicit query parameter still wins, so a rendition is a default, not a cage.
+  function parseOpts(req, q, preset) {
+    const wq = clampInt(q.get('w'), preset ? preset.width || 0 : 0, 1, config.maxDim);
+    const hq = clampInt(q.get('h'), preset ? preset.height || 0 : 0, 1, config.maxDim);
+    let fm = (q.get('fm') || (preset && preset.format) || '').toLowerCase();
     if (fm === 'auto') {
       const a = req.headers.accept || '';
       fm = a.includes('image/avif') ? 'avif' : a.includes('image/webp') ? 'webp' : '';
     }
     if (fm && !FMT_EXT[fm]) fm = '';
+    const fitParam = q.get('fit') || (preset && preset.fit);
     return {
       w: wq || 0,
       h: hq || 0,
-      fit: FIT_VALUES.includes(q.get('fit')) ? q.get('fit') : 'inside',
-      q: clampInt(q.get('q'), config.defaultQuality, 1, 100),
+      fit: FIT_VALUES.includes(fitParam) ? fitParam : 'inside',
+      q: clampInt(q.get('q'), (preset && preset.quality) || config.defaultQuality, 1, 100),
       fm,
     };
   }
 
   return async function handleRead(req, res, reqRel, q) {
-    const opts = parseOpts(req, q);
+    const renditionName = q.get('rendition');
+    const preset = renditionName && renditions ? await renditions.get(renditionName) : null;
+    if (renditionName && !preset) return send(res, 404, `Unknown rendition: ${renditionName}`);
+    const opts = parseOpts(req, q, preset);
     const hasQuery = !!(opts.w || opts.h || opts.fm);
     const posterReq = q.has('poster') || q.has('thumb');
     const transcodeReq = q.get('transcode') || q.get('mp4');

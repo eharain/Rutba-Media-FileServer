@@ -42,7 +42,11 @@ const NOOP_INDEX = { recordPut() {}, recordDelete() {} };
 // exactly as before; when enabled a DELETE moves the master to the trash instead.
 const NOOP_TRASH = { enabled: false, async moveToTrash() { return false; } };
 
-function createWriteHandler({ config, cache, cluster, storage = null, index = NOOP_INDEX, trash = NOOP_TRASH, auth = null, db = null, ffmpeg = null }) {
+// `versions` retains the outgoing bytes when a PUT replaces an existing master.
+// Inert without the DB layer, so a replace still simply overwrites, as before.
+const NOOP_VERSIONS = { enabled: false, async retain() { return null; }, async purgeAll() { return 0; } };
+
+function createWriteHandler({ config, cache, cluster, storage = null, index = NOOP_INDEX, trash = NOOP_TRASH, auth = null, db = null, ffmpeg = null, versions = NOOP_VERSIONS }) {
   return async function handleWrite(req, res, reqRel) {
     const meta = { ip: clientIp(req), userAgent: req.headers['user-agent'] || '' };
     const bearerOk = config.uploadToken && req.headers.authorization === `Bearer ${config.uploadToken}`;
@@ -132,6 +136,15 @@ function createWriteHandler({ config, cache, cluster, storage = null, index = NO
       if (!place) return send(res, 507, 'Insufficient Storage');
       dest = place.abs;
       volumeId = place.volumeId;
+    }
+
+    // Retain the copy this PUT is about to replace, BEFORE the atomic rename lands
+    // on top of it. A replicated write is excluded: the peer that originated it kept
+    // its own history, and duplicating it on every node multiplies the disk cost of
+    // versioning by the size of the cluster.
+    if (versions.enabled && !replicated) {
+      const existing = storage ? await storage.resolveRead(rel) : null;
+      if (existing) await versions.retain(rel, existing.abs, { userId: actingUser ? actingUser.id : null });
     }
 
     await fsp.mkdir(path.dirname(dest), { recursive: true });

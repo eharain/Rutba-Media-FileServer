@@ -31,6 +31,8 @@ const { Runner, spawnServer, sleep, waitFor } = require('./harness');
 // Same TOTP implementation the server uses — the point of the MFA checks is that a
 // standard authenticator's code is accepted, and this is that code generator.
 const totp = require('../src/totp');
+// The same path→cache-key hash the version store names retained copies with.
+const { pathHash } = require('../src/util');
 
 // ── database config (env-driven; no credentials committed) ────────────────────
 const DB = {
@@ -256,6 +258,7 @@ async function bootstrapAdmin(base) {
     // ── accounts & sessions ───────────────────────────────────────────────────
     let adminTok = null, editorTok = null, viewerTok = null, editorId = null, viewerId = null;
     let apiToken = null, disabledUserId = null, mfaTok = null, mfaSecret = null, mfaRecovery = [];
+    let versionedV2Len = 0, collectionId = null, commentId = null;
 
     await t('register: first account bootstraps as admin', async () => {
       const r = await api('/_api/auth/register', { method: 'POST', json: { email: 'admin@test.local', username: 'admin', password: 'adminpw-123' } });
@@ -1050,6 +1053,274 @@ async function bootstrapAdmin(base) {
         await sleep(300);
         assert.equal(await fileRow('nowhere.jpg', DB_NAME_PULL), null);
       });
+    });
+
+    // ── 4.1 version control ───────────────────────────────────────────────────
+    await t('versions: a PUT over an existing master keeps the bytes it replaced', async () => {
+      await put('versioned/doc.png', img2, { token: editorTok });
+      const v2bytes = await sharp({ create: { width: 111, height: 111, channels: 3, background: { r: 1, g: 2, b: 3 } } }).png().toBuffer();
+      await put('versioned/doc.png', v2bytes, { token: editorTok });
+      const r = await api('/_api/files/versions?path=versioned/doc.png', { token: editorTok });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.versions.length, 1, 'one prior copy retained');
+      assert.equal(r.body.versions[0].version_no, 1);
+      assert.equal(r.body.versions[0].size_bytes, img2.length, 'and it is the ORIGINAL bytes');
+      // The live master is the new one.
+      const live = await bytes(`${BASE}/versioned/doc.png`);
+      assert.equal(live.buf.length, v2bytes.length);
+      versionedV2Len = v2bytes.length;
+    });
+
+    await t('versions: retained bytes are not servable at the original URL', async () => {
+      // They live outside every storage volume, like the trash — that is the point.
+      assert.ok(!fs.existsSync(path.join(MASTER_DIR, 'versioned')) || fs.readdirSync(path.join(MASTER_DIR, 'versioned')).length === 1);
+      const dl = await bytes(`${BASE}/_api/files/versions/1?path=versioned/doc.png`, { headers: authH(editorTok) });
+      assert.equal(dl.status, 200);
+      assert.equal(dl.buf.length, img2.length);
+      assert.match(dl.headers.get('content-disposition') || '', /attachment/);
+      assert.equal((await fetch(`${BASE}/_api/files/versions/1?path=versioned/doc.png`)).status, 401, 'and need auth');
+    });
+
+    await t('versions: restoring a version is itself undoable', async () => {
+      const r = await api('/_api/files/versions/restore', { method: 'POST', token: editorTok, json: { path: 'versioned/doc.png', version: 1 } });
+      assert.equal(r.status, 200);
+      const live = await bytes(`${BASE}/versioned/doc.png`);
+      assert.equal(live.buf.length, img2.length, 'the old bytes are live again');
+      const list = await api('/_api/files/versions?path=versioned/doc.png', { token: editorTok });
+      assert.equal(list.body.versions.length, 2, 'and what was live became version 2');
+      assert.equal(list.body.versions[0].size_bytes, versionedV2Len);
+    });
+
+    await t('versions: retention keeps only the configured number of copies', async () => {
+      for (let i = 0; i < 6; i++) {
+        await put('versioned/doc.png', await sharp({ create: { width: 20 + i, height: 20, channels: 3, background: { r: i, g: 0, b: 0 } } }).png().toBuffer(), { token: editorTok });
+      }
+      const r = await api('/_api/files/versions?path=versioned/doc.png', { token: editorTok });
+      assert.equal(r.body.retention.keepCount, 3);
+      assert.equal(r.body.versions.length, 3, 'older copies are trimmed as new ones arrive');
+      // …and the three kept are the newest three.
+      const nos = r.body.versions.map((v) => v.version_no);
+      assert.deepEqual(nos, [...nos].sort((a, b) => b - a));
+    });
+
+    await t('versions: purging one, and purging the master, removes the retained bytes', async () => {
+      const before = (await api('/_api/files/versions?path=versioned/doc.png', { token: editorTok })).body.versions;
+      const r = await api(`/_api/files/versions/${before[0].version_no}?path=versioned/doc.png`, { method: 'DELETE', token: editorTok });
+      assert.equal(r.status, 200);
+      assert.equal((await api('/_api/files/versions?path=versioned/doc.png', { token: editorTok })).body.versions.length, before.length - 1);
+      // Purging the file for good must not leave ITS version files behind. (Other
+      // assets legitimately still have retained copies, so scope the check.)
+      const versionsDir = path.join(TRASH_DIR, 'versions');
+      const prefix = pathHash('versioned/doc.png') + '.';
+      assert.ok(fs.readdirSync(versionsDir).some((f) => f.startsWith(prefix)), 'copies exist before the purge');
+      await del('versioned/doc.png', editorTok);
+      await api('/_api/files/purge', { method: 'POST', token: editorTok, json: { path: 'versioned/doc.png' } });
+      const leftovers = fs.readdirSync(versionsDir).filter((f) => f.startsWith(prefix));
+      assert.equal(leftovers.length, 0, `retained bytes leaked: ${leftovers.join(', ')}`);
+    });
+
+    // ── 4.2 folders ───────────────────────────────────────────────────────────
+    await t('folders: real rows are materialized from the indexed paths', async () => {
+      const r = await api('/_api/folders/sync', { method: 'POST', token: editorTok });
+      assert.equal(r.status, 200);
+      const list = await api('/_api/folders', { token: editorTok });
+      const gallery = list.body.folders.find((f) => f.path === 'gallery');
+      assert.ok(gallery, 'gallery/ is a folder row now, not just a path prefix');
+      assert.ok(gallery.file_count >= 1);
+      const nested = list.body.folders.find((f) => f.path === 'rsynced/deep');
+      assert.ok(nested, 'and so is a nested one');
+      assert.ok(nested.parent_id, 'linked to its parent');
+    });
+
+    await t('folders: a subtree can be moved, taking its files and index rows with it', async () => {
+      await put('proj/a/one.png', img2, { token: editorTok });
+      await put('proj/a/deep/two.png', img2, { token: editorTok });
+      const r = await api('/_api/folders/move', { method: 'POST', token: editorTok, json: { path: 'proj/a', to: 'proj/renamed' } });
+      assert.equal(r.status, 200);
+      assert.equal((await fetch(`${BASE}/proj/renamed/one.png`)).status, 200);
+      assert.equal((await fetch(`${BASE}/proj/renamed/deep/two.png`)).status, 200);
+      assert.equal((await fetch(`${BASE}/proj/a/one.png`)).status, 404);
+      await waitRow('proj/renamed/one.png', (x) => !!x);
+      assert.ok(await fileRow('proj/renamed/deep/two.png'), 'the index followed the whole subtree');
+    });
+
+    await t('folders: a move into itself, or onto something existing, is refused', async () => {
+      assert.equal((await api('/_api/folders/move', { method: 'POST', token: editorTok, json: { path: 'proj/renamed', to: 'proj/renamed/inner' } })).status, 400);
+      assert.equal((await api('/_api/folders/move', { method: 'POST', token: editorTok, json: { path: 'proj/renamed', to: 'gallery' } })).status, 409);
+      assert.equal((await api('/_api/folders/move', { method: 'POST', token: editorTok, json: { path: 'no/such/dir', to: 'x' } })).status, 404);
+    });
+
+    await t('folders: ?folder= scopes a file search to a subtree', async () => {
+      const r = await api('/_api/files?folder=proj/renamed&limit=100', { token: editorTok });
+      assert.equal(r.body.total, 2);
+      assert.ok(r.body.files.every((f) => f.path.startsWith('proj/renamed/')));
+    });
+
+    // ── 4.3 collections ───────────────────────────────────────────────────────
+    await t('collections: a set that cuts across folders', async () => {
+      const c = await api('/_api/collections', { method: 'POST', token: editorTok, json: { name: 'Spring campaign', description: 'hero art' } });
+      assert.equal(c.status, 201);
+      collectionId = c.body.collection.id;
+      const add = await api(`/_api/collections/${collectionId}/files`, {
+        method: 'POST', token: editorTok,
+        json: { add: ['gallery/blue.jpg', 'proj/renamed/one.png', 'not/indexed.jpg'] } });
+      assert.equal(add.body.added, 2, 'unindexed paths are skipped, not fatal');
+      const files = await api(`/_api/collections/${collectionId}/files`, { token: editorTok });
+      assert.equal(files.body.files.length, 2);
+      assert.deepEqual((await api('/_api/collections', { token: editorTok })).body.collections.find((x) => x.id === collectionId).file_count, 2);
+      assert.equal((await api('/_api/collections', { method: 'POST', token: editorTok, json: { name: 'Spring campaign' } })).status, 409);
+    });
+
+    await t('collections: ?collection= filters the file list, by id or by name', async () => {
+      assert.equal((await api(`/_api/files?collection=${collectionId}`, { token: editorTok })).body.total, 2);
+      assert.equal((await api('/_api/files?collection=Spring%20campaign', { token: editorTok })).body.total, 2);
+      const rm = await api(`/_api/collections/${collectionId}/files`, { method: 'POST', token: editorTok, json: { remove: ['gallery/blue.jpg'] } });
+      assert.equal(rm.body.removed, 1);
+      assert.equal((await api(`/_api/files?collection=${collectionId}`, { token: editorTok })).body.total, 1);
+    });
+
+    // ── 4.4 custom metadata ───────────────────────────────────────────────────
+    await t('metadata: an installation defines its own fields', async () => {
+      assert.equal((await api('/_api/fields', { method: 'POST', token: editorTok, json: { field_key: 'client', label: 'Client' } })).status, 403);
+      const f1 = await api('/_api/fields', { method: 'POST', token: adminTok, json: { field_key: 'client', label: 'Client' } });
+      assert.equal(f1.status, 201);
+      assert.equal(f1.body.field.type, 'text');
+      await api('/_api/fields', { method: 'POST', token: adminTok, json: { field_key: 'shoot date', label: 'Shoot date', type: 'date' } });
+      await api('/_api/fields', { method: 'POST', token: adminTok, json: { field_key: 'budget', label: 'Budget', type: 'number' } });
+      const list = await api('/_api/fields', { token: editorTok });
+      const keys = list.body.fields.map((f) => f.field_key);
+      assert.ok(keys.includes('client'));
+      assert.ok(keys.includes('shoot_date'), 'keys are normalized to a safe form');
+      assert.equal((await api('/_api/fields', { method: 'POST', token: adminTok, json: { field_key: 'client', label: 'dup' } })).status, 409);
+    });
+
+    await t('metadata: values are typed, validated and searchable', async () => {
+      const set = await api('/_api/files/fields', { method: 'PUT', token: editorTok, json: {
+        path: 'gallery/blue.jpg', values: { client: 'Acme', budget: 1500, shoot_date: '2026-03-01' } } });
+      assert.equal(set.status, 200);
+      const got = await api('/_api/files/fields?path=gallery/blue.jpg', { token: editorTok });
+      assert.equal(got.body.values.client, 'Acme');
+      assert.equal(got.body.values.budget, 1500);
+      const bad = await api('/_api/files/fields', { method: 'PUT', token: editorTok, json: { path: 'gallery/blue.jpg', values: { budget: 'not-a-number' } } });
+      assert.equal(bad.status, 400);
+      assert.equal(bad.body.error, 'bad_value');
+      // Searchable alongside the built-in filters.
+      assert.equal((await api('/_api/files?field=client&field_value=Acme', { token: editorTok })).body.total, 1);
+      assert.equal((await api('/_api/files?field=client&field_value=Nobody', { token: editorTok })).body.total, 0);
+      assert.ok((await api('/_api/files?field=client', { token: editorTok })).body.total >= 1);
+    });
+
+    // ── 4.6 named renditions ──────────────────────────────────────────────────
+    await t('renditions: a name stands in for a query string', async () => {
+      const r = await api('/_api/renditions', { method: 'POST', token: adminTok, json: {
+        name: 'web-hero', width: 320, height: 180, fit: 'cover', format: 'webp', quality: 70, description: 'Homepage hero' } });
+      assert.equal(r.status, 200);
+      const got = await bytes(`${BASE}/gallery/blue.jpg?rendition=web-hero`);
+      assert.equal(got.status, 200);
+      const m = await sharp(got.buf).metadata();
+      assert.equal(m.format, 'webp');
+      assert.equal(m.width, 320);
+      assert.equal(m.height, 180, 'fit=cover from the preset');
+    });
+
+    await t('renditions: an explicit parameter still overrides the preset', async () => {
+      const m = await sharp((await bytes(`${BASE}/gallery/blue.jpg?rendition=web-hero&w=100`)).buf).metadata();
+      assert.equal(m.width, 100);
+      assert.equal(m.format, 'webp', 'but the rest of the preset still applies');
+    });
+
+    await t('renditions: an unknown name is a clear 404, not a silent full-size image', async () => {
+      const r = await fetch(`${BASE}/gallery/blue.jpg?rendition=nope`);
+      assert.equal(r.status, 404);
+      assert.match(await r.text(), /Unknown rendition/);
+    });
+
+    await t('renditions: deleting one takes effect immediately', async () => {
+      assert.equal((await api('/_api/renditions/web-hero', { method: 'DELETE', token: adminTok })).status, 200);
+      assert.equal((await fetch(`${BASE}/gallery/blue.jpg?rendition=web-hero`)).status, 404);
+      assert.equal((await api('/_api/renditions/web-hero', { method: 'DELETE', token: adminTok })).status, 404);
+    });
+
+    // ── 4.5 saved searches + bulk operations ──────────────────────────────────
+    await t('searches: a filter set can be saved and read back', async () => {
+      const r = await api('/_api/searches', { method: 'POST', token: editorTok, json: { name: 'Acme work', query: { field: 'client', field_value: 'Acme' } } });
+      assert.equal(r.status, 201);
+      const list = await api('/_api/searches', { token: editorTok });
+      const saved = list.body.searches.find((s) => s.name === 'Acme work');
+      assert.ok(saved);
+      assert.equal(saved.query.field_value, 'Acme');
+      assert.equal((await api(`/_api/searches/${saved.id}`, { method: 'DELETE', token: editorTok })).status, 200);
+    });
+
+    await t('bulk: tagging everything matching a filter runs as a job', async () => {
+      const r = await api('/_api/bulk', { method: 'POST', token: editorTok, json: {
+        action: 'tag', filter: { folder: 'proj/renamed' }, params: { tags: ['Bulk Tagged', 'bulk tagged'] } } });
+      assert.equal(r.status, 202);
+      const done = await waitJob(r.body.job.id);
+      assert.equal(done.state, 'done', `bulk error: ${done.error}`);
+      const result = jsonOf(done.result);
+      assert.equal(result.matched, 2);
+      assert.equal(result.applied, 2);
+      // The same normalization a single tag write uses — one tag, not two.
+      const tagged = await api('/_api/files?tag=bulk%20tagged', { token: editorTok });
+      assert.equal(tagged.body.total, 2);
+    });
+
+    await t('bulk: the preview filter and the applied filter are the same set', async () => {
+      const preview = await api('/_api/files?folder=proj/renamed&limit=500', { token: editorTok });
+      const r = await api('/_api/bulk', { method: 'POST', token: editorTok, json: {
+        action: 'collection_add', filter: { folder: 'proj/renamed' }, params: { collection_id: collectionId } } });
+      const done = await waitJob(r.body.job.id);
+      assert.equal(jsonOf(done.result).matched, preview.body.total);
+      assert.equal((await api(`/_api/files?collection=${collectionId}`, { token: editorTok })).body.total, 2);
+    });
+
+    await t('bulk: an unsupported action is refused before anything runs', async () => {
+      const r = await api('/_api/bulk', { method: 'POST', token: editorTok, json: { action: 'incinerate', filter: {} } });
+      assert.equal(r.status, 400);
+      assert.equal(r.body.error, 'bad_action');
+    });
+
+    await t('bulk: untag removes only what was asked for', async () => {
+      const r = await api('/_api/bulk', { method: 'POST', token: editorTok, json: {
+        action: 'untag', filter: { folder: 'proj/renamed' }, params: { tags: ['bulk tagged'] } } });
+      await waitJob(r.body.job.id);
+      assert.equal((await api('/_api/files?tag=bulk%20tagged', { token: editorTok })).body.total, 0);
+    });
+
+    // ── 4.7 comments + notifications ──────────────────────────────────────────
+    await t('comments: a thread per asset, with replies', async () => {
+      const c1 = await api('/_api/comments', { method: 'POST', token: editorTok, json: { path: 'gallery/blue.jpg', body: 'Crop is tight on the left.' } });
+      assert.equal(c1.status, 201);
+      const c2 = await api('/_api/comments', { method: 'POST', token: adminTok, json: { path: 'gallery/blue.jpg', body: 'Agreed — reshooting.', parent_id: c1.body.comment.id } });
+      assert.equal(c2.status, 201);
+      const list = await api('/_api/comments?path=gallery/blue.jpg', { token: viewerTok });
+      assert.equal(list.body.comments.length, 2);
+      assert.equal(list.body.comments[1].parent_id, c1.body.comment.id);
+      assert.equal(list.body.comments[0].username, 'ed', 'attributed to its author');
+      commentId = c1.body.comment.id;
+    });
+
+    await t('comments: resolving and deleting are limited to the author or an admin', async () => {
+      assert.equal((await api(`/_api/comments/${commentId}`, { method: 'PATCH', token: viewerTok, json: { body: 'hijacked' } })).status, 403);
+      const r = await api(`/_api/comments/${commentId}`, { method: 'PATCH', token: editorTok, json: { resolved: true } });
+      assert.equal(r.status, 200);
+      assert.ok(r.body.comment.resolved_at);
+      // Deleting a parent takes its replies with it — an orphaned reply is noise.
+      assert.equal((await api(`/_api/comments/${commentId}`, { method: 'DELETE', token: adminTok })).status, 200);
+      assert.equal((await api('/_api/comments?path=gallery/blue.jpg', { token: editorTok })).body.comments.length, 0);
+    });
+
+    await t('notifications: the people already involved are told, and nobody else', async () => {
+      await api('/_api/comments', { method: 'POST', token: editorTok, json: { path: 'gallery/blue.jpg', body: 'First note.' } });
+      await api('/_api/comments', { method: 'POST', token: adminTok, json: { path: 'gallery/blue.jpg', body: 'Second note.' } });
+      const forEditor = await api('/_api/notifications?unread=1', { token: editorTok });
+      assert.ok(forEditor.body.unread >= 1, 'the earlier commenter hears about the reply');
+      assert.ok(forEditor.body.notifications.every((n) => n.actor_id !== editorId), 'but never about their own comments');
+      const forViewer = await api('/_api/notifications?unread=1', { token: viewerTok });
+      assert.equal(forViewer.body.unread, 0, 'an uninvolved user is not spammed');
+      assert.equal((await api('/_api/notifications/read', { method: 'POST', token: editorTok, json: {} })).status, 200);
+      assert.equal((await api('/_api/notifications?unread=1', { token: editorTok })).body.unread, 0);
     });
 
     // ── API tokens ────────────────────────────────────────────────────────────

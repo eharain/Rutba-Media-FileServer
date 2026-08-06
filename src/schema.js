@@ -178,18 +178,22 @@ const STATEMENTS = [
      FULLTEXT KEY ft_files_name (name)
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
-  // Prior bytes retained for version control / restore.
+  // Prior bytes retained for version control / restore. Without this a PUT over an
+  // existing master destroyed the previous bytes outright; now the outgoing copy is
+  // moved aside (same discipline as the trash) before the new one lands.
   `CREATE TABLE IF NOT EXISTS file_versions (
      id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
      file_id       BIGINT UNSIGNED NOT NULL,
      version_no    INT UNSIGNED NOT NULL,
      size_bytes    BIGINT UNSIGNED NOT NULL DEFAULT 0,
+     mime          VARCHAR(128) NULL,
      checksum_sha256 CHAR(64) NULL,
      stored_path   VARCHAR(1024) NOT NULL,
      created_by    BIGINT UNSIGNED NULL,
      created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
      PRIMARY KEY (id),
      UNIQUE KEY uq_file_versions (file_id, version_no),
+     KEY idx_file_versions_file (file_id, version_no),
      CONSTRAINT fk_file_versions_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
@@ -237,6 +241,99 @@ const STATEMENTS = [
      CONSTRAINT fk_file_tags_tag  FOREIGN KEY (tag_id)  REFERENCES tags(id)  ON DELETE CASCADE
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+  // ── Library organization ───────────────────────────────────────────────────
+  // Collections: cross-cutting sets independent of path — a campaign, a client, a
+  // release. The organizing primitive folders cannot express, because an asset
+  // lives in exactly one folder and belongs to any number of collections.
+  `CREATE TABLE IF NOT EXISTS collections (
+     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     name          VARCHAR(191) NOT NULL,
+     description   TEXT NULL,
+     owner_user_id BIGINT UNSIGNED NULL,
+     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_collections_name (name),
+     KEY idx_collections_owner (owner_user_id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  `CREATE TABLE IF NOT EXISTS collection_files (
+     collection_id BIGINT UNSIGNED NOT NULL,
+     file_id       BIGINT UNSIGNED NOT NULL,
+     position      INT UNSIGNED NULL,
+     added_by      BIGINT UNSIGNED NULL,
+     added_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (collection_id, file_id),
+     KEY idx_collection_files_file (file_id),
+     CONSTRAINT fk_collection_files_collection FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+     CONSTRAINT fk_collection_files_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // Custom metadata: per-installation field definitions attached to assets. What
+  // turns "a file server with tags" into a catalog an organization can model its own
+  // taxonomy in — and the write target for AI-suggested values.
+  `CREATE TABLE IF NOT EXISTS metadata_fields (
+     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     field_key    VARCHAR(64) NOT NULL,
+     label        VARCHAR(191) NOT NULL,
+     type         ENUM('text','number','date','enum','multi','bool') NOT NULL DEFAULT 'text',
+     options      JSON NULL,
+     required     TINYINT(1) NOT NULL DEFAULT 0,
+     position     INT NOT NULL DEFAULT 0,
+     created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_metadata_fields_key (field_key)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // One row per (file, field). The value is written to the column matching the
+  // field's type as well as `value_text`, so filtering can use a real index and an
+  // ordering that means something — "date after X" on a text column does not.
+  `CREATE TABLE IF NOT EXISTS file_field_values (
+     file_id    BIGINT UNSIGNED NOT NULL,
+     field_id   BIGINT UNSIGNED NOT NULL,
+     value_text TEXT NULL,
+     value_num  DECIMAL(20,6) NULL,
+     value_date DATETIME NULL,
+     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+     PRIMARY KEY (file_id, field_id),
+     KEY idx_ffv_field_num (field_id, value_num),
+     KEY idx_ffv_field_date (field_id, value_date),
+     KEY idx_ffv_field_text (field_id, value_text(191)),
+     CONSTRAINT fk_ffv_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+     CONSTRAINT fk_ffv_field FOREIGN KEY (field_id) REFERENCES metadata_fields(id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // Named renditions: "web-hero" instead of "?w=1600&h=900&fit=cover&q=82&fm=webp".
+  // Pure metadata over the resize engine that already exists — downstream teams ask
+  // for a rendition and the definition can change without touching their URLs.
+  `CREATE TABLE IF NOT EXISTS renditions (
+     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     name        VARCHAR(64) NOT NULL,
+     width       INT UNSIGNED NULL,
+     height      INT UNSIGNED NULL,
+     fit         VARCHAR(16) NULL,
+     format      VARCHAR(16) NULL,
+     quality     INT UNSIGNED NULL,
+     description VARCHAR(255) NULL,
+     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_renditions_name (name)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // A filter set worth keeping. Also the input to a bulk operation, so "everything
+  // matching this" is one saved thing rather than a query retyped each time.
+  `CREATE TABLE IF NOT EXISTS saved_searches (
+     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     name          VARCHAR(191) NOT NULL,
+     query         JSON NOT NULL,
+     owner_user_id BIGINT UNSIGNED NULL,
+     shared        TINYINT(1) NOT NULL DEFAULT 0,
+     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_saved_searches (owner_user_id, name),
+     KEY idx_saved_searches_shared (shared)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
   // ── Collaboration ──────────────────────────────────────────────────────────
   // Shareable links (optionally password-protected / expiring / download-capped).
   `CREATE TABLE IF NOT EXISTS shares (
@@ -257,15 +354,38 @@ const STATEMENTS = [
      KEY idx_shares_folder (folder_id)
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+  // Threaded comments per asset. `parent_id` makes a reply a reply; `resolved_at`
+  // lets a review thread be closed without deleting the conversation.
   `CREATE TABLE IF NOT EXISTS comments (
-     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-     file_id    BIGINT UNSIGNED NOT NULL,
-     user_id    BIGINT UNSIGNED NULL,
-     body       TEXT NOT NULL,
-     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     file_id     BIGINT UNSIGNED NOT NULL,
+     user_id     BIGINT UNSIGNED NULL,
+     parent_id   BIGINT UNSIGNED NULL,
+     body        TEXT NOT NULL,
+     resolved_at DATETIME NULL,
+     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
      PRIMARY KEY (id),
      KEY idx_comments_file (file_id),
+     KEY idx_comments_parent (parent_id),
      CONSTRAINT fk_comments_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // In-app notifications. Delivery beyond the console (email, webhooks) is a separate
+  // decision; this is the durable record either way.
+  `CREATE TABLE IF NOT EXISTS notifications (
+     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     user_id    BIGINT UNSIGNED NOT NULL,
+     kind       VARCHAR(64) NOT NULL,
+     body       VARCHAR(1024) NOT NULL,
+     file_id    BIGINT UNSIGNED NULL,
+     actor_id   BIGINT UNSIGNED NULL,
+     read_at    DATETIME NULL,
+     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     KEY idx_notifications_user (user_id, read_at),
+     CONSTRAINT fk_notifications_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+     CONSTRAINT fk_notifications_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
   // ── Background work ────────────────────────────────────────────────────────
@@ -389,6 +509,29 @@ const MIGRATIONS = [
     id: 'files.status_missing',
     if: { columnTypeLacks: ['files', 'status', 'missing'] },
     sql: ["ALTER TABLE files MODIFY COLUMN status ENUM('active','trashed','missing') NOT NULL DEFAULT 'active'"],
+  },
+  // 4.7 — comments were laid down flat; threading and resolution came later.
+  {
+    id: 'comments.parent_id',
+    if: { columnMissing: ['comments', 'parent_id'] },
+    sql: [
+      'ALTER TABLE comments ADD COLUMN parent_id BIGINT UNSIGNED NULL AFTER user_id',
+      'ALTER TABLE comments ADD KEY idx_comments_parent (parent_id)',
+    ],
+  },
+  {
+    id: 'comments.resolved_at',
+    if: { columnMissing: ['comments', 'resolved_at'] },
+    sql: [
+      'ALTER TABLE comments ADD COLUMN resolved_at DATETIME NULL',
+      'ALTER TABLE comments ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
+    ],
+  },
+  // 4.1 — a version needs to record the mime it was, not just its bytes.
+  {
+    id: 'file_versions.mime',
+    if: { columnMissing: ['file_versions', 'mime'] },
+    sql: ['ALTER TABLE file_versions ADD COLUMN mime VARCHAR(128) NULL AFTER size_bytes'],
   },
 ];
 

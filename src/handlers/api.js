@@ -29,8 +29,10 @@
  */
 
 const crypto = require('crypto');
-const { sendJson, readJson, clientIp, wantSecureCookie } = require('../http');
+const { sendJson, readJson, clientIp, wantSecureCookie, streamFile } = require('../http');
 const { hasRole, hashPassword, mysqlDate, totp } = require('../auth');
+const { createAssetRoutes } = require('./assets');
+const { buildFileFilter } = require('./filequery');
 
 // Short enough not to be theatre, long enough to matter. Deliberately not a
 // composition rule (uppercase + digit + symbol), which pushes people toward
@@ -42,7 +44,7 @@ const MIN_PASSWORD_LENGTH = 8;
 // thing an HTTP endpoint should offer.
 const QUEUEABLE_JOBS = new Set(['scan', 'extract', 'sweep']);
 
-function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
+function createApiHandler({ config, db, auth, trash, storage, jobs = null, versions = null, index = null, masterops = null, cache = null, renditions = null }) {
   // Wrap a handler so it only runs with a live DB, and turn thrown {statusCode}
   // errors into clean JSON responses.
   const guarded = (fn) => async (req, res, ctx) => {
@@ -63,6 +65,11 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
   const requireAdmin = async (req) => {
     const ctx = await requireAuth(req);
     if (!hasRole(ctx, 'admin')) throw httpErr(403, 'forbidden', 'Admin role required');
+    return ctx;
+  };
+  const requireEditor = async (req) => {
+    const ctx = await requireAuth(req);
+    if (!hasRole(ctx, 'editor')) throw httpErr(403, 'forbidden', 'Editor role required');
     return ctx;
   };
 
@@ -109,6 +116,18 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     ['GET', /^\/_api\/jobs\/(\d+)$/, guarded(getJob)],
     ['POST', /^\/_api\/jobs\/(\d+)\/cancel$/, guarded(cancelJob)],
     ['POST', /^\/_api\/jobs\/(\d+)\/retry$/, guarded(retryJob)],
+    // Asset-management routes live in their own module for size; same namespace,
+    // same guards, same dispatcher. Appended AFTER the routes above so a specific
+    // path like /_api/files/tags is never shadowed by a broader pattern.
+    ...createAssetRoutes({
+      config, db, storage, jobs, versions, index, masterops,
+      guarded, requireAuth, requireAdmin, requireEditor, audit, httpErr, requireFields, clampInt,
+      sendJson, readJson, streamFile,
+      isAdmin: (ctx) => hasRole(ctx, 'admin'),
+      purgeCache: (rel) => (cache ? cache.purgeForPath(rel) : Promise.resolve()),
+      // An edited rendition must take effect now, not when its 30s cache expires.
+      invalidateRenditions: () => renditions && renditions.invalidate(),
+    }),
   ];
 
   async function register(req, res) {
@@ -468,23 +487,9 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
   async function listFiles(req, res, { url }) {
     await requireAuth(req);
     const q = url.searchParams;
-    const where = [];
-    const args = [];
-    // `missing` joined active/trashed once the scanner could report bytes that
-    // vanished from every volume; `all` drops the filter entirely.
-    const status = (q.get('status') || 'active').toLowerCase();
-    if (status !== 'all') {
-      where.push('status = ?');
-      args.push(['trashed', 'missing', 'active'].includes(status) ? status : 'active');
-    }
-    if (q.get('q')) { where.push('(path LIKE ? OR name LIKE ?)'); const like = `%${q.get('q')}%`; args.push(like, like); }
-    if (q.get('type')) { where.push('mime LIKE ?'); args.push(`${q.get('type')}%`); }
-    if (q.get('visibility')) { where.push('visibility = ?'); args.push(q.get('visibility') === 'private' ? 'private' : 'public'); }
-    if (q.get('tag')) {
-      where.push('id IN (SELECT ft.file_id FROM file_tags ft JOIN tags t ON t.id = ft.tag_id WHERE t.name = ?)');
-      args.push(q.get('tag'));
-    }
-    const clause = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    // Shared with the bulk job (handlers/filequery.js) so the set you preview is
+    // exactly the set a bulk action touches.
+    const { clause, args } = buildFileFilter((k) => q.get(k));
     const limit = clampInt(q.get('limit'), 50, 1, 500);
     const offset = clampInt(q.get('offset'), 0, 0, 1e9);
     const totalRow = await db.one(`SELECT COUNT(*) AS n FROM files ${clause}`, args);
@@ -587,6 +592,9 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     const body = await readJson(req);
     requireFields(body, ['path']);
     const rel = String(body.path).replace(/^\/+/, '');
+    // Retained versions live outside the trash, so purging the master has to take
+    // them too — otherwise "permanently delete" leaves copies on disk.
+    if (versions) await versions.purgeAll(rel).catch(() => {});
     await trash.purge(rel);
     await audit(req, 'purge', rel, ctx.user.id);
     return sendJson(res, 200, { ok: true });
@@ -594,6 +602,10 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
 
   async function emptyTrash(req, res) {
     const ctx = await requireAdmin(req);
+    if (versions) {
+      const rows = await db.query("SELECT path FROM files WHERE status='trashed'").catch(() => []);
+      for (const r of rows) await versions.purgeAll(r.path).catch(() => {});
+    }
     const r = await trash.emptyTrash();
     await audit(req, 'empty_trash', null, ctx.user.id);
     return sendJson(res, 200, r);

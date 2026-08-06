@@ -52,6 +52,17 @@ function loadConfig(env = process.env) {
     // rename) but OUTSIDE it, so trashed bytes are never servable. Override with
     // TRASH_DIR. With no DB the trash is unused and DELETE hard-unlinks as before.
     trashDir: path.resolve(expandHome(env.TRASH_DIR || path.join(path.dirname(masterDir), '.media-trash'))),
+    // ── Version control (needs the DB layer) ────────────────────────────────────
+    // Retained copies of masters that were replaced by a later PUT. Kept beside the
+    // trash — outside every served volume — for the same reason: retained bytes must
+    // never be servable at their original URL. On by default once the DB layer is up,
+    // like the trash; VERSIONS_ENABLED=0 or VERSION_RETAIN_COUNT=0 turns it off.
+    versionsDir: path.resolve(expandHome(env.VERSIONS_DIR
+      || path.join(env.TRASH_DIR ? path.resolve(expandHome(env.TRASH_DIR)) : path.join(path.dirname(masterDir), '.media-trash'), 'versions'))),
+    versionsEnabled: !/^(0|false|off|no)$/i.test(env.VERSIONS_ENABLED || ''),
+    versionRetainCount: env.VERSION_RETAIN_COUNT != null && env.VERSION_RETAIN_COUNT !== ''
+      ? Math.max(0, parseInt(env.VERSION_RETAIN_COUNT, 10) || 0) : 3,
+    versionRetainDays: parseInt(env.VERSION_RETAIN_DAYS, 10) || 0, // 0 = no age limit
     // ── Multi-volume storage (optional) ─────────────────────────────────────────
     // Masters may be spread across several directories / mounts. `masterDir` is
     // always volume `default` (first); extra volumes come from STORAGE_VOLUMES,

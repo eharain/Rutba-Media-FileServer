@@ -19,7 +19,9 @@ const { normalizeMetadata, normalizeProbe } = require('./metadata');
 const { RASTER, MIME } = require('./constants');
 const { visibilityFor, writeSidecar, removeSidecar } = require('./visibility');
 
-function createMasterOps({ config, storage, cache, cluster, index, trash, sharp, ffmpeg }) {
+const NOOP_VERSIONS = { enabled: false, async retain() { return null; } };
+
+function createMasterOps({ config, storage, cache, cluster, index, trash, sharp, ffmpeg, versions = NOOP_VERSIONS }) {
   const visOf = (rel) => visibilityFor(rel, undefined, config.privatePaths);
 
   // Stream `readable` into the master at `rel` (placed per policy), atomically, then
@@ -28,6 +30,12 @@ function createMasterOps({ config, storage, cache, cluster, index, trash, sharp,
     const place = await storage.placeWrite(rel, { sizeHint });
     if (!place) { const e = new Error('Insufficient Storage'); e.statusCode = 507; throw e; }
     const dest = place.abs;
+    // Keep the copy this write replaces (WebDAV PUT, COPY onto an existing name…),
+    // exactly as the HTTP write path does.
+    if (versions.enabled) {
+      const existing = await storage.resolveRead(rel);
+      if (existing) await versions.retain(rel, existing.abs, { userId: actingUser ? actingUser.id : null });
+    }
     await fsp.mkdir(path.dirname(dest), { recursive: true });
     const tmp = dest + '.up.' + process.pid + '.tmp';
     const hash = crypto.createHash('sha256');

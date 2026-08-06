@@ -29,6 +29,8 @@ const { createJobs } = require('./jobs');
 const { createScanner } = require('./scanner');
 const { registerJobTypes } = require('./jobtypes');
 const { createTrash } = require('./trash');
+const { createVersions } = require('./versions');
+const { createRenditions } = require('./renditions');
 const { createMasterResolver } = require('./resolve');
 const { createReadGuard } = require('./readauth');
 const { createReadHandler } = require('./handlers/read');
@@ -70,18 +72,21 @@ function createApp(config) {
   const cluster = new Cluster({ role: config.clusterRole, peers: config.clusterPeers, secret: config.clusterSecret, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.clusterTimeoutMs, onStored: indexPulled });
 
   const scanner = createScanner({ config, storage, db, index, jobs });
-  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db });
   const trash = createTrash({ config, db, cluster, storage });
+  // Retained copies of masters a later PUT replaced. Inert without the DB layer.
+  const versions = createVersions({ config, db, storage });
+  const renditions = createRenditions({ db });
   const resolveMaster = createMasterResolver({ config, storage, origin, cluster });
   // READ_AUTH_MODE enforcement. `public` (the default) yields an open guard that
   // short-circuits, so the read path is unchanged unless the mode is actually set.
   const readGuard = createReadGuard({ config, auth });
-  const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster, media, readGuard });
-  const handleWrite = createWriteHandler({ config, cache, cluster, storage, index, trash, auth, db, ffmpeg });
-  const handleApi = createApiHandler({ config, db, auth, trash, storage, jobs });
+  const masterops = createMasterOps({ config, storage, cache, cluster, index, trash, sharp, ffmpeg, versions });
+  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db, masterops });
+  const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster, media, readGuard, renditions });
+  const handleWrite = createWriteHandler({ config, cache, cluster, storage, index, trash, auth, db, ffmpeg, versions });
+  const handleApi = createApiHandler({ config, db, auth, trash, storage, jobs, versions, index, masterops, cache, renditions });
   const handleUi = createUiHandler({ db });
   const handleShare = createShareHandler({ config, db, storage });
-  const masterops = createMasterOps({ config, storage, cache, cluster, index, trash, sharp, ffmpeg });
   const handleDav = createWebdavHandler({ config, db, auth, storage, masterops });
 
   const server = http.createServer(async (req, res) => {
@@ -118,7 +123,7 @@ function createApp(config) {
   });
   server.on('clientError', (err, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 
-  return { server, cache, resizer, media, ffmpeg, origin, cluster, storage, db, auth, trash, sharp, jobs, scanner, index };
+  return { server, cache, resizer, media, ffmpeg, origin, cluster, storage, db, auth, trash, sharp, jobs, scanner, index, versions, renditions, masterops };
 }
 
 module.exports = { createApp };
