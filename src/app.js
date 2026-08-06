@@ -31,6 +31,8 @@ const { registerJobTypes } = require('./jobtypes');
 const { createTrash } = require('./trash');
 const { createVersions } = require('./versions');
 const { createRenditions } = require('./renditions');
+const { createAi } = require('./ai');
+const { createAiStore } = require('./aistore');
 const { createMasterResolver } = require('./resolve');
 const { createReadGuard } = require('./readauth');
 const { createReadHandler } = require('./handlers/read');
@@ -81,10 +83,15 @@ function createApp(config) {
   // short-circuits, so the read path is unchanged unless the mode is actually set.
   const readGuard = createReadGuard({ config, auth });
   const masterops = createMasterOps({ config, storage, cache, cluster, index, trash, sharp, ffmpeg, versions });
-  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db, masterops });
+  // AI enrichment. Gated on the SDK being installed AND a key being configured —
+  // with either missing, `ai.enabled` is false, no enrichment job type is
+  // registered, no column is populated, and the console tab is absent.
+  const ai = createAi({ config, db });
+  const aiStore = createAiStore({ db });
+  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db, masterops, ai, aiStore });
   const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster, media, readGuard, renditions });
   const handleWrite = createWriteHandler({ config, cache, cluster, storage, index, trash, auth, db, ffmpeg, versions });
-  const handleApi = createApiHandler({ config, db, auth, trash, storage, jobs, versions, index, masterops, cache, renditions });
+  const handleApi = createApiHandler({ config, db, auth, trash, storage, jobs, versions, index, masterops, cache, renditions, ai, aiStore });
   const handleUi = createUiHandler({ db });
   const handleShare = createShareHandler({ config, db, storage });
   const handleDav = createWebdavHandler({ config, db, auth, storage, masterops });
@@ -123,7 +130,7 @@ function createApp(config) {
   });
   server.on('clientError', (err, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 
-  return { server, cache, resizer, media, ffmpeg, origin, cluster, storage, db, auth, trash, sharp, jobs, scanner, index, versions, renditions, masterops };
+  return { server, cache, resizer, media, ffmpeg, origin, cluster, storage, db, auth, trash, sharp, jobs, scanner, index, versions, renditions, masterops, ai, aiStore };
 }
 
 module.exports = { createApp };

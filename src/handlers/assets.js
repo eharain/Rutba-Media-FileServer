@@ -21,6 +21,7 @@
 
 const path = require('path');
 const { pathKey } = require('../util');
+const { fromObject } = require('./filequery');
 
 function createAssetRoutes(ctx) {
   const {
@@ -376,6 +377,9 @@ function createAssetRoutes(ctx) {
       throw httpErr(400, 'bad_action', `Unsupported bulk action: ${action}`);
     }
     if (!jobs || !jobs.enabled) throw httpErr(503, 'jobs_disabled', 'Bulk operations need the job queue');
+    // Refuse up front rather than queueing thousands of jobs no handler in this
+    // deployment will ever claim.
+    if (action === 'enrich') requireAi();
     const id = await jobs.enqueue('bulk', {
       action,
       filter: body.filter && typeof body.filter === 'object' ? body.filter : {},
@@ -474,7 +478,114 @@ function createAssetRoutes(ctx) {
     return sendJson(res, 200, { ok: true });
   }
 
+  // ── 5.8 AI review + 5.9 cost accounting ─────────────────────────────────────
+  // The console surface for AI output. Nothing a model produced is allowed to be
+  // indistinguishable from what a person asserted — so suggestions live apart from
+  // human tags and only become human tags through an explicit promotion here.
+  const { ai, aiStore } = ctx;
+  function requireAi() {
+    if (!ai || !ai.enabled) throw httpErr(503, 'ai_disabled', `AI enrichment is not configured (${(ai && ai.disabledReason) || 'no provider'})`);
+    return ai;
+  }
+
+  async function aiStatus(req, res) {
+    await requireAuth(req);
+    const enabled = !!(ai && ai.enabled);
+    const body = { enabled, reason: enabled ? null : (ai && ai.disabledReason) || 'no provider' };
+    if (enabled) {
+      body.model = ai.model;
+      body.promptVersion = ai.promptVersion;
+      body.pricingPerMTok = ai.pricing;
+      body.maxImageDim = config.aiMaxImageDim;
+      body.budget = { monthlyUsd: config.aiMonthlyBudgetUsd || null, spentThisMonth: await ai.monthlySpend() };
+    }
+    return sendJson(res, 200, body);
+  }
+
+  async function getFileAi(req, res, { url }) {
+    await requireAuth(req);
+    const rel = relOfBody(url.searchParams.get('path'));
+    if (!rel) throw httpErr(400, 'missing_field', 'Missing field: path');
+    return sendJson(res, 200, { ai: aiStore ? await aiStore.get(rel) : null });
+  }
+
+  /**
+   * Review actions: accept (promote suggested tags to human tags), reject
+   * (individual tags or the whole enrichment), and edit the generated prose.
+   * A human edit is authoritative — a later re-run overwrites the machine output,
+   * but a rejected tag never comes back.
+   */
+  async function reviewFileAi(req, res) {
+    const c = await requireEditor(req);
+    const body = await readJson(req);
+    requireFields(body, ['path', 'action']);
+    const rel = relOfBody(body.path);
+    const file = await fileByRel(rel, { allowTrashed: true });
+    const action = String(body.action);
+    let result;
+    switch (action) {
+      case 'promote_tags':
+        result = { promoted: await aiStore.promoteTags(file.id, body.tags || [], c.user.id) };
+        break;
+      case 'reject_tags':
+        result = { rejected: await aiStore.rejectTags(file.id, body.tags || [], c.user.id) };
+        break;
+      case 'edit':
+        result = { edited: await aiStore.edit(file.id, body.fields || {}, c.user.id) };
+        break;
+      case 'reject':
+        result = { rejected: await aiStore.reject(file.id, c.user.id) };
+        break;
+      default:
+        throw httpErr(400, 'bad_action', `Unsupported review action: ${action}`);
+    }
+    await audit(req, 'ai_review_' + action, rel, c.user.id);
+    return sendJson(res, 200, { ok: true, ...result, ai: await aiStore.get(rel) });
+  }
+
+  /** Queue enrichment: one asset live, or a whole filter through the batch path. */
+  async function enrich(req, res) {
+    const c = await requireEditor(req);
+    requireAi();
+    if (!jobs || !jobs.enabled) throw httpErr(503, 'jobs_disabled', 'Enrichment needs the job queue');
+    const body = await readJson(req);
+    if (body.path) {
+      const rel = relOfBody(body.path);
+      await fileByRel(rel);
+      const id = await jobs.enqueue('enrich', { path: rel }, {
+        dedupeKey: `enrich:${pathKey(rel)}`, priority: 5, createdBy: c.user.id,
+      });
+      await audit(req, 'ai_enrich', rel, c.user.id);
+      return sendJson(res, 202, { job: await jobs.get(id) });
+    }
+    // Bulk: the Batches API at half price is the right shape for a library, and is
+    // the default for anything but a single asset.
+    const id = await jobs.enqueue('enrich_batch', {
+      filter: body.filter && typeof body.filter === 'object' ? body.filter : {},
+      limit: body.limit, userId: c.user.id,
+    }, { priority: 7, createdBy: c.user.id });
+    await audit(req, 'ai_backfill', null, c.user.id);
+    return sendJson(res, 202, { job: await jobs.get(id) });
+  }
+
+  async function aiUsage(req, res, { url }) {
+    await requireAdmin(req);
+    const usage = aiStore ? await aiStore.usage({ days: clampInt(url.searchParams.get('days'), 30, 1, 365) }) : {};
+    const batches = db ? await db.query('SELECT * FROM ai_batches ORDER BY id DESC LIMIT 50').catch(() => []) : [];
+    return sendJson(res, 200, {
+      ...usage,
+      budget: { monthlyUsd: config.aiMonthlyBudgetUsd || null },
+      model: ai && ai.enabled ? ai.model : null,
+      batches,
+    });
+  }
+
   return [
+    ['GET', /^\/_api\/ai\/status$/, guarded(aiStatus)],
+    ['GET', /^\/_api\/ai\/usage$/, guarded(aiUsage)],
+    ['POST', /^\/_api\/ai\/enrich$/, guarded(enrich)],
+    ['GET', /^\/_api\/files\/ai$/, guarded(getFileAi)],
+    ['POST', /^\/_api\/files\/ai\/review$/, guarded(reviewFileAi)],
     ['GET', /^\/_api\/files\/versions$/, guarded(listVersions)],
     ['GET', /^\/_api\/files\/versions\/(\d+)$/, guarded(getVersion)],
     ['POST', /^\/_api\/files\/versions\/restore$/, guarded(restoreVersion)],

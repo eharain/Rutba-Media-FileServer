@@ -16,10 +16,30 @@
  */
 
 const path = require('path');
+const fsp = require('fs/promises');
 const { RASTER, MIME } = require('./constants');
 const { normalizeMetadata, normalizeProbe } = require('./metadata');
 const { pathKey } = require('./util');
 const { fromObject } = require('./handlers/filequery');
+
+/**
+ * Produce the image actually sent to the model: JPEG, long edge bounded to
+ * `maxDim`, never upscaled. This is the single biggest cost lever in the whole AI
+ * layer — the API bills an image by area, so sending a 4000px master costs several
+ * times what a 1568px variant does for tagging quality that does not differ.
+ * Also keeps requests clear of the 32 MB per-request cap.
+ */
+async function downscaleForVision(abs, maxDim, sharp) {
+  if (!sharp) {
+    return { data: await fsp.readFile(abs), mediaType: 'image/jpeg' };
+  }
+  const data = await sharp(abs)
+    .rotate() // honor EXIF orientation, or the model describes a sideways photo
+    .resize({ width: maxDim, height: maxDim, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 82 })
+    .toBuffer();
+  return { data, mediaType: 'image/jpeg' };
+}
 
 // Tags are normalized identically wherever they are written — trimmed, lowercased,
 // deduped, length-capped — so a bulk tag and a single tag produce the same rows.
@@ -34,7 +54,7 @@ function normalizeTags(names) {
 // gone within the hour, long enough to be invisible.
 const SWEEP_INTERVAL_MS = 15 * 60 * 1000;
 
-function registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db = null, masterops = null }) {
+function registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db = null, masterops = null, ai = null, aiStore = null }) {
   // Registration is deliberately unconditional on `jobs.enabled`: wiring happens in
   // createApp, but the database only comes up later in db.init(), so gating here
   // would leave every handler unregistered and the worker with nothing to claim.
@@ -154,6 +174,145 @@ function registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config
           'DELETE ft FROM file_tags ft JOIN tags t ON t.id = ft.tag_id WHERE ft.file_id = ? AND t.name = ?', [fileId, raw]);
       }
     };
+  }
+
+  // ── enrich / enrich_batch ───────────────────────────────────────────────────
+  // Registered ONLY when a provider is configured. With no key these types have no
+  // handler in this process, so `POST /_api/jobs {type:"enrich"}` is refused up
+  // front rather than queueing work nothing will ever run.
+  if (ai && ai.enabled && aiStore && db) {
+    jobs.register('enrich', async (payload, ctx) => {
+      const rel = String(payload.path || '').replace(/^\/+/, '');
+      if (!rel) throw new Error('enrich: missing path');
+      const fileId = await aiStore.fileIdFor(rel);
+      if (!fileId) return { path: rel, skipped: 'not_indexed' };
+
+      const hit = await storage.resolveRead(rel);
+      if (!hit) return { path: rel, missing: true };
+
+      const ext = path.extname(rel).toLowerCase();
+      const mime = MIME[ext] || '';
+      try {
+        let result;
+        if (RASTER.has(ext) && ext !== '.svg') {
+          // THE cost lever: send a bounded variant, never the master. The API bills
+          // images by area, so a 4000px photo costs several times a 1568px one for
+          // tagging quality that does not differ.
+          const payloadImage = await downscaleForVision(hit.abs, config.aiMaxImageDim, sharp);
+          result = await ai.enrichImage(payloadImage, { fileId, hint: path.basename(rel) });
+        } else if (mime === 'application/pdf') {
+          const data = await fsp.readFile(hit.abs);
+          result = await ai.enrichDocument({ data, mediaType: 'application/pdf' }, { fileId, hint: path.basename(rel) });
+        } else {
+          return { path: rel, skipped: `unsupported type ${mime || ext}` };
+        }
+        await aiStore.save(fileId, result, { model: result.model, promptVersion: result.promptVersion, cost: result.cost });
+        return { path: rel, tags: result.tags.length, cost: result.cost, model: result.model };
+      } catch (e) {
+        // A refusal, a budget stop, or bad output is a RESULT, not a transient
+        // fault — record it and stop, so it shows up in review instead of burning
+        // four more attempts against the same asset (and the same budget).
+        if (['refusal', 'bad_output', 'empty_output', 'budget_exceeded'].includes(e.error)) {
+          await aiStore.saveFailure(fileId, e.message, { model: ai.model, promptVersion: ai.promptVersion });
+          ctx.log(`enrich ${rel}: ${e.error} — ${e.message}`);
+          return { path: rel, failed: e.error, message: e.message };
+        }
+        throw e; // network/rate-limit — let the queue back off and retry
+      }
+    }, { leaseSeconds: 300 });
+
+    // Bulk backfill through the Message Batches API — half price, and the right
+    // shape for a library rather than a trickle. One job submits a batch and then
+    // re-queues itself to poll, so a batch that takes an hour holds no worker slot.
+    jobs.register('enrich_batch', async (payload, ctx) => {
+      if (payload.batchId) return ingestBatch(payload.batchId, ctx);
+
+      const { clause, args } = fromObject(payload.filter || {});
+      const limit = Math.min(config.aiBatchSize, Number(payload.limit) || config.aiBatchSize);
+      // Only assets that have no enrichment yet — a backfill must be resumable and
+      // must not re-bill work already paid for.
+      //
+      // Deliberately a subquery rather than a LEFT JOIN: the shared filter builder
+      // emits unqualified column names (`status = ?`, `id IN (...)`), which are
+      // ambiguous the moment a second table joins in.
+      const rows = await db.query(
+        `SELECT id, path, ext FROM files
+          ${clause ? clause + ' AND' : 'WHERE'} id NOT IN (SELECT file_id FROM file_ai)
+          ORDER BY id LIMIT ${limit}`, args);
+      const candidates = rows.filter((r) => RASTER.has(String(r.ext || '').toLowerCase()));
+      if (!candidates.length) return { submitted: 0, note: 'nothing left to enrich' };
+
+      const requests = [];
+      const mapping = [];
+      for (const row of candidates) {
+        const hit = await storage.resolveRead(row.path);
+        if (!hit) continue;
+        const customId = `f${row.id}`;
+        const img = await downscaleForVision(hit.abs, config.aiMaxImageDim, sharp);
+        requests.push(ai.imageBatchRequest(customId, img, path.basename(row.path)));
+        mapping.push([customId, row.id, row.path]);
+        if (requests.length % 20 === 0) await ctx.heartbeat({ prepared: requests.length, of: candidates.length });
+      }
+      if (!requests.length) return { submitted: 0, note: 'no readable bytes for the matched assets' };
+
+      const batch = await ai.submitBatch(requests);
+      await db.query(
+        'INSERT INTO ai_batches (batch_id, state, model, requested, created_by) VALUES (?, ?, ?, ?, ?)',
+        [batch.id, batch.state, ai.model, requests.length, payload.userId || null]);
+      for (const [customId, fileId, p] of mapping) {
+        await db.query('INSERT IGNORE INTO ai_batch_items (batch_id, custom_id, file_id, path) VALUES (?, ?, ?, ?)',
+          [batch.id, customId, fileId, p]);
+      }
+      // Poll on the queue, not in this handler — a batch can take an hour.
+      await jobs.enqueue('enrich_batch', { batchId: batch.id }, {
+        dedupeKey: `enrich_batch:${batch.id}`, priority: 8, runAfterMs: config.aiBatchPollMs,
+      });
+      ctx.log(`submitted batch ${batch.id} with ${requests.length} assets`);
+      return { submitted: requests.length, batchId: batch.id };
+    }, { leaseSeconds: 900 });
+
+    async function ingestBatch(batchId, ctx) {
+      const status = await ai.batchStatus(batchId);
+      await db.query('UPDATE ai_batches SET state = ? WHERE batch_id = ?', [status.state, batchId]).catch(() => {});
+      if (status.state !== 'ended') {
+        // Not ready — come back later rather than holding a worker slot open.
+        await jobs.enqueue('enrich_batch', { batchId }, {
+          dedupeKey: `enrich_batch:${batchId}`, priority: 8, runAfterMs: config.aiBatchPollMs * 2,
+        });
+        return { batchId, state: status.state, pending: true };
+      }
+
+      let ok = 0, failed = 0;
+      for await (const item of ai.batchResults(batchId)) {
+        // Results arrive in ANY order — the custom_id → file_id mapping is the only
+        // thing that ties a result back to an asset.
+        const map = await db.one('SELECT file_id, path FROM ai_batch_items WHERE batch_id = ? AND custom_id = ?',
+          [batchId, item.custom_id]);
+        if (!map) continue;
+        if (item.result.type !== 'succeeded') {
+          await aiStore.saveFailure(map.file_id, `batch ${item.result.type}`, { model: ai.model, promptVersion: ai.promptVersion });
+          failed++;
+          continue;
+        }
+        try {
+          const parsed = ai.parseResult(item.result.message);
+          const cost = await ai.record('image_batch', item.result.message.usage, { fileId: map.file_id, batchId, batch: true });
+          await aiStore.save(map.file_id, { ...parsed, usage: item.result.message.usage }, {
+            model: ai.model, promptVersion: ai.promptVersion, cost,
+          });
+          ok++;
+        } catch (e) {
+          await aiStore.saveFailure(map.file_id, e.message, { model: ai.model, promptVersion: ai.promptVersion });
+          failed++;
+        }
+        if ((ok + failed) % 25 === 0) await ctx.heartbeat({ ingested: ok + failed });
+      }
+      await db.query(
+        'UPDATE ai_batches SET state = ?, succeeded = ?, errored = ?, finished_at = NOW() WHERE batch_id = ?',
+        ['ingested', ok, failed, batchId]).catch(() => {});
+      ctx.log(`batch ${batchId} ingested — ${ok} ok, ${failed} failed`);
+      return { batchId, ingested: ok, failed };
+    }
   }
 
   // ── sweep ───────────────────────────────────────────────────────────────────

@@ -166,6 +166,23 @@ function loadConfig(env = process.env) {
     scanOnBoot: /^(1|true|yes|on)$/i.test(env.SCAN_ON_BOOT || ''),
     // Ceiling on scan throughput so a reconcile never starves request-path I/O.
     scanRateFilesPerSec: parseInt(env.SCAN_RATE_FILES_PER_SEC, 10) || 200,
+    // ── AI enrichment (needs the DB layer + job queue) ─────────────────────────
+    // No key ⇒ every enrichment job type is unregistered, no column is populated,
+    // and the console tab is absent. AI_ENABLED=0 turns it off with a key present.
+    aiApiKey: env.ANTHROPIC_API_KEY || '',
+    aiEnabled: !/^(0|false|off|no)$/i.test(env.AI_ENABLED || ''),
+    aiModel: env.AI_MODEL || 'claude-opus-5',
+    // Long edge of the variant sent for enrichment. Bounding this is the single
+    // biggest cost lever there is — an image bills by area.
+    aiMaxImageDim: parseInt(env.AI_MAX_IMAGE_DIM, 10) || 1568,
+    // Hard monthly ceiling in USD, checked BEFORE every call. 0 = uncapped.
+    aiMonthlyBudgetUsd: Number(env.AI_MONTHLY_BUDGET_USD) || 0,
+    // Assets per submitted Message Batch (the half-price bulk path).
+    aiBatchSize: Math.max(1, Math.min(1000, parseInt(env.AI_BATCH_SIZE, 10) || 200)),
+    // How long to wait before re-checking a submitted batch. Most complete within
+    // an hour, so polling is deliberately unhurried — the job re-queues itself
+    // rather than holding a worker slot open.
+    aiBatchPollMs: Math.max(200, parseInt(env.AI_BATCH_POLL_MS, 10) || 60_000),
   };
 }
 

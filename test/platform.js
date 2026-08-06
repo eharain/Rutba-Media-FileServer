@@ -125,6 +125,97 @@ async function makeVideo() {
 }
 
 /**
+ * A stub Anthropic API.
+ *
+ * The AI layer is worth testing end-to-end — job → downscale → request → structured
+ * response → store → review — and none of that should need a real key or cost money
+ * on every CI run. The SDK honors ANTHROPIC_BASE_URL, so pointing it at this server
+ * exercises the entire path with the real client, real request shapes and real
+ * parsing; only the upstream is fake.
+ *
+ * It also records what it received, so the tests can assert on the things that
+ * actually matter for cost: that the image was downscaled before being sent, and
+ * that the cacheable prefix carries a cache_control breakpoint.
+ */
+function startStubAnthropic({ fail = false } = {}) {
+  const http = require('http');
+  const seen = { messages: [], batches: [] };
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      let parsed = null;
+      try { parsed = JSON.parse(body || '{}'); } catch { /* not all routes have a body */ }
+      const json = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      const url = req.url.split('?')[0];
+
+      // Live single-asset enrichment.
+      if (url === '/v1/messages' && req.method === 'POST') {
+        seen.messages.push(parsed);
+        if (fail) return json(200, stubRefusal());
+        return json(200, stubMessage());
+      }
+      // Bulk backfill through the Batches API.
+      if (url === '/v1/messages/batches' && req.method === 'POST') {
+        seen.batches.push(parsed);
+        return json(200, {
+          id: 'msgbatch_stub01', type: 'message_batch', processing_status: 'ended',
+          request_counts: { processing: 0, succeeded: parsed.requests.length, errored: 0, canceled: 0, expired: 0 },
+        });
+      }
+      if (/^\/v1\/messages\/batches\/[^/]+$/.test(url) && req.method === 'GET') {
+        return json(200, {
+          id: 'msgbatch_stub01', type: 'message_batch', processing_status: 'ended',
+          request_counts: { processing: 0, succeeded: seen.batches[0] ? seen.batches[0].requests.length : 0, errored: 0, canceled: 0, expired: 0 },
+          results_url: '/v1/messages/batches/msgbatch_stub01/results',
+        });
+      }
+      // Results are JSONL, and deliberately returned in REVERSE order — the code
+      // must key them by custom_id rather than by position.
+      if (/\/results$/.test(url)) {
+        const reqs = (seen.batches[0] && seen.batches[0].requests) || [];
+        const lines = [...reqs].reverse().map((r) => JSON.stringify({
+          custom_id: r.custom_id, result: { type: 'succeeded', message: stubMessage() },
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/x-jsonl' });
+        return res.end(lines.join('\n') + '\n');
+      }
+      json(404, { type: 'error', error: { type: 'not_found_error', message: url } });
+    });
+  });
+  return new Promise((resolve) => {
+    srv.listen(0, '127.0.0.1', () => resolve({
+      base: `http://127.0.0.1:${srv.address().port}`,
+      seen,
+      stop: () => srv.close(),
+    }));
+  });
+}
+
+function stubMessage() {
+  return {
+    id: 'msg_stub', type: 'message', role: 'assistant', model: 'claude-opus-5',
+    stop_reason: 'end_turn', stop_details: null,
+    content: [{ type: 'text', text: JSON.stringify({
+      caption: 'A flat blue rectangle.',
+      alt_text: 'Solid blue image',
+      description: 'A single-colour blue field with no other subject matter.',
+      tags: ['Blue', 'blue', '  abstract ', 'colour field'],
+      detected_text: '',
+      confidence: 0.91,
+    }) }],
+    usage: { input_tokens: 1200, output_tokens: 90, cache_creation_input_tokens: 0, cache_read_input_tokens: 800 },
+  };
+}
+function stubRefusal() {
+  return {
+    id: 'msg_stub_refusal', type: 'message', role: 'assistant', model: 'claude-opus-5',
+    stop_reason: 'refusal', stop_details: { type: 'refusal', category: 'cyber', explanation: 'nope' },
+    content: [], usage: { input_tokens: 10, output_tokens: 0 },
+  };
+}
+
+/**
  * Stand up the pieces needed to exercise pull-through indexing, run `fn`, tear down:
  *
  *   - a mock external origin serving one master
@@ -206,6 +297,66 @@ async function withNode({ label, port, dbName, env = {}, seed = null }, fn) {
   } finally {
     if (node) node.stop();
   }
+}
+
+/**
+ * A node with the AI layer configured against the stub upstream (see
+ * startStubAnthropic), plus one seeded image. Its own database, like every other
+ * throwaway node here.
+ */
+async function withStubAi({ img, fail = false, label = 'ainode', budget = 0.02 }, fn) {
+  const stub = await startStubAnthropic({ fail });
+  const dbName = `${DB_NAME}_${label}`;
+  try {
+    await withNode({
+      label, port: PORT + (label === 'ainode' ? 5 : 6), dbName,
+      seed: { 'shoot/blue.jpg': img },
+      env: {
+        ANTHROPIC_API_KEY: 'sk-ant-stub-key',
+        ANTHROPIC_BASE_URL: stub.base,
+        AI_MODEL: 'claude-opus-5',
+        // Deliberately small: the seeded master is 900x600, so a correct
+        // implementation must actually resize before sending.
+        AI_MAX_IMAGE_DIM: '900',
+        AI_MONTHLY_BUDGET_USD: String(budget),
+        JOBS_POLL_MS: '300',
+        // Poll a submitted batch promptly; in production this is a minute.
+        AI_BATCH_POLL_MS: '500',
+      },
+    }, (node) => fn(node, stub));
+  } finally {
+    stub.stop();
+  }
+}
+
+// A JSON call against a node other than the main one.
+async function nodeApi(node, pathname, { method = 'GET', token = null, json = null } = {}) {
+  const res = await fetch(node.base + pathname, {
+    method,
+    headers: { ...(json ? { 'Content-Type': 'application/json' } : {}), ...authH(token) },
+    body: json ? JSON.stringify(json) : undefined,
+  });
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  return { status: res.status, body };
+}
+
+// Queue a job on another node and wait for it to finish.
+async function runJob(node, token, spec) {
+  const r = await nodeApi(node, '/_api/jobs', { method: 'POST', token, json: spec });
+  if (r.status !== 202) throw new Error(`could not queue ${spec.type}: ${r.status} ${JSON.stringify(r.body)}`);
+  return waitJobOn(node, token, r.body.job.id);
+}
+async function waitJobOn(node, token, id, tries = 400, gap = 100) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    const r = await nodeApi(node, `/_api/jobs/${id}`, { token });
+    last = r.body && r.body.job;
+    if (last && ['done', 'failed', 'cancelled'].includes(last.state)) return last;
+    await sleep(gap);
+  }
+  throw new Error(`job ${id} never finished (last state: ${last && last.state})`);
 }
 
 // Register an admin on a fresh node and return its bearer token.
@@ -833,6 +984,9 @@ async function bootstrapAdmin(base) {
       assert.equal((await fetch(`${BASE}/_ui/../server.js`)).status, 404, 'no traversal out of web/');
       const shell = await (await fetch(`${BASE}/_ui/`)).text();
       assert.match(shell, /data-view="jobs"/, 'the console exposes the background-jobs view');
+      // The AI nav entry ships hidden and is revealed only when /_api/ai/status
+      // reports a configured provider — no key, no tab.
+      assert.match(shell, /nav-ai hidden/, 'the AI tab is absent until a provider is configured');
     });
 
     // ── index integrity: the path-collision bug ───────────────────────────────
@@ -1015,6 +1169,190 @@ async function bootstrapAdmin(base) {
       assert.deepEqual(result.volumes, ['vol2']);
       assert.equal(result.missing, 0, 'a scoped scan must not finalize across volumes');
       assert.equal((await fileRow('gallery/blue.jpg')).status, 'active');
+    });
+
+    // ── AI enrichment: off by default ─────────────────────────────────────────
+    // The main node has no ANTHROPIC_API_KEY, which is the shipping default. The
+    // whole layer must be absent, not merely idle.
+    await t('ai: with no key configured the layer reports itself off', async () => {
+      const r = await api('/_api/ai/status', { token: editorTok });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.enabled, false);
+      assert.match(r.body.reason, /ANTHROPIC_API_KEY/);
+      assert.equal(r.body.model, undefined, 'and leaks no configuration');
+    });
+
+    await t('ai: no key means no enrichment job type exists at all', async () => {
+      const w = await api('/_api/jobs', { token: adminTok });
+      assert.ok(!w.body.worker.types.includes('enrich'), 'enrich is unregistered');
+      assert.ok(!w.body.worker.types.includes('enrich_batch'));
+      const r = await api('/_api/ai/enrich', { method: 'POST', token: editorTok, json: { path: 'gallery/blue.jpg' } });
+      assert.equal(r.status, 503);
+      assert.equal(r.body.error, 'ai_disabled');
+    });
+
+    await t('ai: bulk enrich is refused rather than queueing unclaimable jobs', async () => {
+      const r = await api('/_api/bulk', { method: 'POST', token: editorTok, json: { action: 'enrich', filter: { folder: 'gallery' } } });
+      assert.equal(r.status, 503);
+      assert.equal(r.body.error, 'ai_disabled');
+    });
+
+    await t('ai: no key means no AI columns are populated', async () => {
+      assert.equal((await api('/_api/files/ai?path=gallery/blue.jpg', { token: editorTok })).body.ai, null);
+      const conn = await inspectConn();
+      const [rows] = await conn.query('SELECT COUNT(*) AS n FROM file_ai');
+      assert.equal(Number(rows[0].n), 0);
+    });
+
+    // ── AI enrichment: the full path, against a stub upstream ─────────────────
+    await withStubAi({ img }, async (node, stub) => {
+      let aiTok = null;
+      await t('ai: a configured node enriches an image end to end', async () => {
+        aiTok = await bootstrapAdmin(node.base);
+        const status = await nodeApi(node, '/_api/ai/status', { token: aiTok });
+        assert.equal(status.body.enabled, true);
+        assert.equal(status.body.model, 'claude-opus-5');
+
+        // Index the seeded master, then enrich it.
+        await runJob(node, aiTok, { type: 'scan' });
+        const job = await runJob(node, aiTok, { type: 'enrich', payload: { path: 'shoot/blue.jpg' } });
+        assert.equal(job.state, 'done', `enrich failed: ${job.error}`);
+
+        const got = await nodeApi(node, '/_api/files/ai?path=shoot/blue.jpg', { token: aiTok });
+        assert.equal(got.body.ai.status, 'ok');
+        assert.equal(got.body.ai.caption, 'A flat blue rectangle.');
+        assert.equal(got.body.ai.alt_text, 'Solid blue image');
+        assert.equal(got.body.ai.model, 'claude-opus-5');
+        assert.equal(got.body.ai.prompt_version, 'v1');
+      });
+
+      await t('ai: the image is downscaled before it is sent — the cost lever', async () => {
+        const sent = stub.seen.messages[0];
+        assert.ok(sent, 'the stub received a request');
+        const imageBlock = sent.messages[0].content.find((b) => b.type === 'image');
+        assert.ok(imageBlock, 'an image block was sent');
+        assert.equal(imageBlock.source.media_type, 'image/jpeg');
+        const meta = await sharp(Buffer.from(imageBlock.source.data, 'base64')).metadata();
+        assert.ok(Math.max(meta.width, meta.height) <= 900,
+          `long edge must be bounded by AI_MAX_IMAGE_DIM, got ${meta.width}x${meta.height}`);
+        assert.ok(meta.width < 1600, 'and must not be the full-size master');
+      });
+
+      await t('ai: the instruction prefix is marked cacheable, the image is not', async () => {
+        const sent = stub.seen.messages[0];
+        assert.ok(sent.system.some((b) => b.cache_control), 'system prefix carries a cache breakpoint');
+        assert.ok(sent.messages[0].content.every((b) => !b.cache_control), 'the per-asset content does not');
+        assert.equal(sent.output_config.format.type, 'json_schema', 'and output is schema-constrained');
+      });
+
+      await t('ai: suggested tags are kept apart from human tags until promoted', async () => {
+        const got = await nodeApi(node, '/_api/files/ai?path=shoot/blue.jpg', { token: aiTok });
+        const tags = got.body.ai.tags.map((x) => x.tag).sort();
+        // Normalized the same way human tags are: trimmed, lowercased, deduped.
+        assert.deepEqual(tags, ['abstract', 'blue', 'colour field']);
+        assert.ok(got.body.ai.tags.every((x) => !x.promoted_at), 'nothing is promoted on its own');
+        const human = await nodeApi(node, '/_api/files/tags?path=shoot/blue.jpg', { token: aiTok });
+        assert.deepEqual(human.body.tags, [], 'and no AI tag has leaked into the human set');
+      });
+
+      await t('ai: promoting a tag is the explicit act that makes it a human tag', async () => {
+        const r = await nodeApi(node, '/_api/files/ai/review', { method: 'POST', token: aiTok,
+          json: { path: 'shoot/blue.jpg', action: 'promote_tags', tags: ['blue'] } });
+        assert.equal(r.status, 200);
+        assert.equal(r.body.promoted, 1);
+        const human = await nodeApi(node, '/_api/files/tags?path=shoot/blue.jpg', { token: aiTok });
+        assert.deepEqual(human.body.tags, ['blue']);
+        assert.ok(r.body.ai.tags.find((x) => x.tag === 'blue').promoted_at, 'and it is marked promoted');
+      });
+
+      await t('ai: a rejected tag is removed and never comes back on a re-run', async () => {
+        await nodeApi(node, '/_api/files/ai/review', { method: 'POST', token: aiTok,
+          json: { path: 'shoot/blue.jpg', action: 'reject_tags', tags: ['abstract'] } });
+        const job = await runJob(node, aiTok, { type: 'enrich', payload: { path: 'shoot/blue.jpg' } });
+        assert.equal(job.state, 'done');
+        const got = await nodeApi(node, '/_api/files/ai?path=shoot/blue.jpg', { token: aiTok });
+        const rejected = got.body.ai.tags.find((x) => x.tag === 'abstract');
+        assert.ok(rejected && rejected.rejected_at, 're-running enrichment must not resurrect a rejected tag');
+      });
+
+      await t('ai: a human edit of the generated prose sticks', async () => {
+        const r = await nodeApi(node, '/_api/files/ai/review', { method: 'POST', token: aiTok,
+          json: { path: 'shoot/blue.jpg', action: 'edit', fields: { caption: 'Hand-written caption.' } } });
+        assert.equal(r.body.ai.caption, 'Hand-written caption.');
+        assert.ok(r.body.ai.reviewed_at, 'and is recorded as reviewed');
+      });
+
+      await t('ai: every call is metered, and the cost maths is right', async () => {
+        const usage = await nodeApi(node, '/_api/ai/usage', { token: aiTok });
+        assert.equal(usage.status, 200);
+        assert.ok(usage.body.total.calls >= 2);
+        // Opus 5 is $5/$25 per MTok, cache reads bill at 0.1x input. The stub reports
+        // 1200 input + 800 cache-read + 90 output, so each call is
+        //   (1200×5 + 800×5×0.1 + 90×25) / 1e6 = $0.00865
+        assert.ok(Math.abs(usage.body.total.cost - usage.body.total.calls * 0.00865) < 1e-6,
+          `expected ${usage.body.total.calls} × $0.00865, got $${usage.body.total.cost}`);
+        assert.ok(usage.body.monthToDate > 0);
+      });
+
+      await t('ai: bulk backfill goes through the Batches API and keys results by custom_id', async () => {
+        // Two more assets with no enrichment yet.
+        for (const name of ['shoot/b.jpg', 'shoot/c.jpg']) {
+          await fetch(`${node.base}/${name}`, { method: 'PUT', headers: authH(TOKEN), body: img });
+        }
+        await runJob(node, aiTok, { type: 'scan' });
+        const r = await nodeApi(node, '/_api/ai/enrich', { method: 'POST', token: aiTok, json: { filter: { folder: 'shoot' } } });
+        assert.equal(r.status, 202);
+        const done = await waitJobOn(node, aiTok, r.body.job.id);
+        assert.equal(done.state, 'done', `batch submit failed: ${done.error}`);
+        assert.ok(stub.seen.batches.length === 1, 'one batch was submitted');
+        assert.equal(jsonOf(done.result).submitted, 2, 'only the un-enriched assets were included');
+
+        // The follow-up poll job ingests the (deliberately out-of-order) results.
+        await waitFor(async () => {
+          const got = await nodeApi(node, '/_api/files/ai?path=shoot/b.jpg', { token: aiTok });
+          return got.body.ai && got.body.ai.status === 'ok';
+        }, 300, 100);
+        for (const name of ['shoot/b.jpg', 'shoot/c.jpg']) {
+          const got = await nodeApi(node, `/_api/files/ai?path=${name}`, { token: aiTok });
+          assert.equal(got.body.ai.caption, 'A flat blue rectangle.', `${name} got its own result`);
+        }
+      });
+
+      await t('ai: batch spend is billed at half price', async () => {
+        const usage = await nodeApi(node, '/_api/ai/usage', { token: aiTok });
+        const batchKind = usage.body.byKind.find((k) => k.kind === 'image_batch');
+        assert.ok(batchKind, 'batch calls are metered separately');
+        assert.ok(Math.abs(batchKind.cost - batchKind.calls * 0.004325) < 1e-6,
+          `batch should be half of $0.00865, got $${batchKind.cost / batchKind.calls} per call`);
+      });
+
+      await t('ai: a budget ceiling is enforced BEFORE the call, not reported after', async () => {
+        // The node runs with AI_MONTHLY_BUDGET_USD=0.02; the calls above have taken
+        // spend past it, so the next one must be refused WITHOUT reaching the API.
+        const before = stub.seen.messages.length;
+        await fetch(`${node.base}/shoot/over-budget.jpg`, { method: 'PUT', headers: authH(TOKEN), body: img });
+        await runJob(node, aiTok, { type: 'scan' });
+        const job = await runJob(node, aiTok, { type: 'enrich', payload: { path: 'shoot/over-budget.jpg' } });
+        assert.equal(job.state, 'done');
+        assert.equal(jsonOf(job.result).failed, 'budget_exceeded');
+        assert.equal(stub.seen.messages.length, before, 'no request was sent upstream');
+        const got = await nodeApi(node, '/_api/files/ai?path=shoot/over-budget.jpg', { token: aiTok });
+        assert.equal(got.body.ai.status, 'failed', 'and the refusal is visible in review');
+      });
+    });
+
+    await withStubAi({ img, fail: true, label: 'airefuse', budget: 0 }, async (node) => {
+      await t('ai: a model refusal is recorded once, not retried four more times', async () => {
+        const tok = await bootstrapAdmin(node.base);
+        await runJob(node, tok, { type: 'scan' });
+        const job = await runJob(node, tok, { type: 'enrich', payload: { path: 'shoot/blue.jpg' } });
+        assert.equal(job.state, 'done', 'a refusal is a result, not a transient fault');
+        assert.equal(Number(job.attempts), 1, 'so it is not retried');
+        assert.equal(jsonOf(job.result).failed, 'refusal');
+        const got = await nodeApi(node, '/_api/files/ai?path=shoot/blue.jpg', { token: tok });
+        assert.equal(got.body.ai.status, 'failed');
+        assert.match(got.body.ai.error, /declined/);
+      });
     });
 
     // ── pull-through indexing ─────────────────────────────────────────────────

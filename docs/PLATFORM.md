@@ -169,6 +169,11 @@ namespace never collides with media paths (like `/_health`).
 | `POST /_api/bulk` | editor | Apply an action to everything matching a filter, as a job |
 | `GET/POST /_api/comments` · `PATCH`/`DELETE /_api/comments/:id` | bearer | Per-asset discussion |
 | `GET  /_api/notifications` · `POST /_api/notifications/read` | bearer | In-app notifications |
+| `GET  /_api/ai/status` | bearer | Whether enrichment is configured, model, pricing, budget |
+| `POST /_api/ai/enrich` | editor | Enrich one asset `{path}`, or backfill a filter `{filter,limit?}` |
+| `GET  /_api/files/ai?path=` | bearer | AI output for one asset, with its suggested tags |
+| `POST /_api/files/ai/review` | editor | `promote_tags` / `reject_tags` / `edit` / `reject` |
+| `GET  /_api/ai/usage` | admin | Token and dollar accounting, by day and by kind |
 
 ¹ First account always allowed; subsequent self-registration needs `ALLOW_REGISTRATION=true`.
 
@@ -310,6 +315,46 @@ that gets touched. Saved searches persist a filter set by name.
 people already involved — the asset's owner and everyone who has commented on it —
 and nobody else, because a notification feed that includes the whole installation is
 useless within a week.
+
+## AI enrichment
+
+Machine-generated metadata for every asset: tags, captions, alt text, detected text,
+document summaries. **All of it is metadata — a master is never modified.**
+
+Gated twice over, like every optional layer here: the `@anthropic-ai/sdk` package is
+an *optional* dependency and `ANTHROPIC_API_KEY` is optional configuration. With
+either missing, no enrichment job type is registered, no column is populated, and the
+console tab is absent. `AI_ENABLED=0` turns it off with a key present.
+
+**Human tags and machine tags are different things.** Suggestions land in
+`file_ai_tags`, never in `file_tags`. They become real tags only when somebody
+promotes them from the review surface — an explicit, audited act. A rejected tag stays
+rejected: re-running enrichment never resurrects it. Every row records the model *and*
+prompt version that produced it, so a bad prompt is revocable rather than an
+archaeology project.
+
+**Cost is the design constraint**, and three decisions carry most of it:
+
+| Lever | Why it matters |
+|---|---|
+| Send a **resized variant**, not the master (`AI_MAX_IMAGE_DIM`, default 1568px) | Images bill by area — a 4000px master costs several times a 1568px one for tagging quality that does not differ. This is the single biggest lever. |
+| **Cache the instruction prefix** | The taxonomy and output rules are identical on every call, so they sit before the cache breakpoint and the per-asset image after it. Cache reads bill at ~0.1× input. |
+| **Batch the backfill** | `POST /_api/ai/enrich` with a `filter` submits a Message Batch at **half price**. Assets that already have enrichment are skipped, so it is safe to re-run and resumes where it left off. |
+
+`AI_MONTHLY_BUDGET_USD` is a **hard ceiling checked before every call**, batches
+included — not a number reported after the fact. Every call is metered into
+`ai_usage` and surfaced at `GET /_api/ai/usage` and in the console.
+
+A model refusal, a malformed response, or an exhausted budget is recorded as a
+**result** and not retried: it shows up in review instead of burning four more
+attempts and four more dollars against the same asset.
+
+> **Deployment note.** The Batches API is available on the first-party Claude API and
+> Claude Platform on AWS, but **not** on Bedrock, Vertex or Foundry — on those, bulk
+> backfill falls back to the live path at full price.
+
+**Still open** (see the roadmap): transcription needs a speech-to-text engine, and
+semantic search needs an embeddings source. Neither decision is made here.
 
 ## Background jobs
 

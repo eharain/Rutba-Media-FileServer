@@ -42,9 +42,9 @@ const MIN_PASSWORD_LENGTH = 8;
 // Job types an admin may queue from the API. Deliberately a whitelist: the queue is
 // an execution surface, and "run any registered type with any payload" is not a
 // thing an HTTP endpoint should offer.
-const QUEUEABLE_JOBS = new Set(['scan', 'extract', 'sweep']);
+const QUEUEABLE_JOBS = new Set(['scan', 'extract', 'sweep', 'enrich', 'enrich_batch']);
 
-function createApiHandler({ config, db, auth, trash, storage, jobs = null, versions = null, index = null, masterops = null, cache = null, renditions = null }) {
+function createApiHandler({ config, db, auth, trash, storage, jobs = null, versions = null, index = null, masterops = null, cache = null, renditions = null, ai = null, aiStore = null }) {
   // Wrap a handler so it only runs with a live DB, and turn thrown {statusCode}
   // errors into clean JSON responses.
   const guarded = (fn) => async (req, res, ctx) => {
@@ -120,7 +120,7 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null, versi
     // same guards, same dispatcher. Appended AFTER the routes above so a specific
     // path like /_api/files/tags is never shadowed by a broader pattern.
     ...createAssetRoutes({
-      config, db, storage, jobs, versions, index, masterops,
+      config, db, storage, jobs, versions, index, masterops, ai, aiStore,
       guarded, requireAuth, requireAdmin, requireEditor, audit, httpErr, requireFields, clampInt,
       sendJson, readJson, streamFile,
       isAdmin: (ctx) => hasRole(ctx, 'admin'),
@@ -711,8 +711,8 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null, versi
     // sweep gets no dedupe key so it never collides with the self-scheduled one.
     const dedupeKey = type === 'scan'
       ? `scan:${payload.volumeId || 'all'}`
-      : type === 'extract' && payload.path
-        ? `extract:${require('../util').pathKey(String(payload.path).replace(/^\/+/, ''))}`
+      : (type === 'extract' || type === 'enrich') && payload.path
+        ? `${type}:${require('../util').pathKey(String(payload.path).replace(/^\/+/, ''))}`
         : null;
     const id = await requireJobs().enqueue(type, payload, { dedupeKey, priority: 4, createdBy: ctx.user.id });
     if (!id) throw httpErr(500, 'enqueue_failed', 'Could not queue the job');

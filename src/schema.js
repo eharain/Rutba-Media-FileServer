@@ -388,6 +388,105 @@ const STATEMENTS = [
      CONSTRAINT fk_notifications_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+  // ── AI enrichment ──────────────────────────────────────────────────────────
+  // Machine-generated metadata for an asset. Masters are NEVER modified — this is
+  // metadata about them and nothing else.
+  //
+  // Every row records the model and prompt version that produced it, so a re-run is
+  // auditable and a bad prompt is revocable: "delete everything prompt v3 wrote" is
+  // one DELETE, not an archaeology project.
+  `CREATE TABLE IF NOT EXISTS file_ai (
+     file_id        BIGINT UNSIGNED NOT NULL,
+     status         ENUM('pending','ok','failed','rejected') NOT NULL DEFAULT 'pending',
+     caption        VARCHAR(1024) NULL,
+     alt_text       VARCHAR(512) NULL,
+     description    TEXT NULL,
+     detected_text  TEXT NULL,
+     summary        TEXT NULL,
+     entities       JSON NULL,
+     suggested_fields JSON NULL,
+     confidence     DECIMAL(4,3) NULL,
+     model          VARCHAR(64) NULL,
+     prompt_version VARCHAR(32) NULL,
+     input_tokens   INT UNSIGNED NOT NULL DEFAULT 0,
+     output_tokens  INT UNSIGNED NOT NULL DEFAULT 0,
+     cost_usd       DECIMAL(12,6) NOT NULL DEFAULT 0,
+     error          TEXT NULL,
+     reviewed_by    BIGINT UNSIGNED NULL,
+     reviewed_at    DATETIME NULL,
+     created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+     PRIMARY KEY (file_id),
+     KEY idx_file_ai_status (status),
+     KEY idx_file_ai_model (model, prompt_version),
+     CONSTRAINT fk_file_ai_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // AI-suggested tags, kept DELIBERATELY SEPARATE from `file_tags`. A person's tags
+  // must never be silently overwritten by a model's, and a reviewer has to be able to
+  // tell which is which. Promotion is an explicit act (`promoted_at`).
+  `CREATE TABLE IF NOT EXISTS file_ai_tags (
+     file_id     BIGINT UNSIGNED NOT NULL,
+     tag         VARCHAR(120) NOT NULL,
+     confidence  DECIMAL(4,3) NULL,
+     model       VARCHAR(64) NULL,
+     promoted_at DATETIME NULL,
+     rejected_at DATETIME NULL,
+     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (file_id, tag),
+     KEY idx_file_ai_tags_tag (tag),
+     CONSTRAINT fk_file_ai_tags_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // Per-call token and dollar accounting. Without it, bulk enrichment is
+  // unbudgetable — and a monthly ceiling has nothing to measure itself against.
+  `CREATE TABLE IF NOT EXISTS ai_usage (
+     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     kind          VARCHAR(32) NOT NULL,
+     model         VARCHAR(64) NOT NULL,
+     file_id       BIGINT UNSIGNED NULL,
+     user_id       BIGINT UNSIGNED NULL,
+     batch_id      VARCHAR(64) NULL,
+     input_tokens  INT UNSIGNED NOT NULL DEFAULT 0,
+     output_tokens INT UNSIGNED NOT NULL DEFAULT 0,
+     cache_write_tokens INT UNSIGNED NOT NULL DEFAULT 0,
+     cache_read_tokens  INT UNSIGNED NOT NULL DEFAULT 0,
+     cost_usd      DECIMAL(12,6) NOT NULL DEFAULT 0,
+     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     KEY idx_ai_usage_created (created_at),
+     KEY idx_ai_usage_user (user_id, created_at),
+     KEY idx_ai_usage_batch (batch_id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // A submitted Message Batch — the half-price path for backfilling a library.
+  // Results are keyed by `custom_id` and arrive in ANY order, so the mapping from
+  // custom_id back to file_id has to be persisted, not inferred from position.
+  `CREATE TABLE IF NOT EXISTS ai_batches (
+     id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     batch_id      VARCHAR(64) NOT NULL,
+     state         VARCHAR(32) NOT NULL DEFAULT 'submitted',
+     model         VARCHAR(64) NULL,
+     requested     INT UNSIGNED NOT NULL DEFAULT 0,
+     succeeded     INT UNSIGNED NOT NULL DEFAULT 0,
+     errored       INT UNSIGNED NOT NULL DEFAULT 0,
+     created_by    BIGINT UNSIGNED NULL,
+     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+     finished_at   DATETIME NULL,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_ai_batches_batch (batch_id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  `CREATE TABLE IF NOT EXISTS ai_batch_items (
+     batch_id   VARCHAR(64) NOT NULL,
+     custom_id  VARCHAR(64) NOT NULL,
+     file_id    BIGINT UNSIGNED NOT NULL,
+     path       VARCHAR(1024) NOT NULL,
+     PRIMARY KEY (batch_id, custom_id),
+     KEY idx_ai_batch_items_file (file_id)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
   // ── Background work ────────────────────────────────────────────────────────
   // The single queue every asynchronous feature rides on: filesystem scans,
   // metadata extraction, transcodes, AI enrichment, integrity scrubs, purges.

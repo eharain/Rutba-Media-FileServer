@@ -137,6 +137,7 @@ function enterApp() {
   $('#who-name').textContent = S.user ? (S.user.display_name || S.user.username) : '';
   $('#who-role').textContent = S.roles.join(', ');
   $$('.nav-admin').forEach((n) => n.classList.toggle('hidden', !isAdmin()));
+  refreshAiNav();
   refreshStats();
   if (!location.hash) location.hash = '#/files';
   else route();
@@ -156,6 +157,21 @@ $('#theme-toggle').addEventListener('click', () => {
   applyTheme(cur === 'dark' ? 'light' : 'dark');
 });
 
+/**
+ * The AI nav entry exists only when a provider is actually configured — "no key ⇒
+ * no console tab" is part of the gate, not a cosmetic detail. A dead tab that
+ * explains it is disabled is still a tab.
+ */
+async function refreshAiNav() {
+  const link = $('.nav-ai');
+  if (!link) return;
+  if (!isAdmin()) { link.classList.add('hidden'); return; }
+  try {
+    const s = await api('GET', '/_api/ai/status');
+    link.classList.toggle('hidden', !s.enabled);
+  } catch { link.classList.add('hidden'); }
+}
+
 async function refreshStats() {
   if (!isAdmin()) { $('#stat-strip').innerHTML = ''; return; }
   try {
@@ -174,9 +190,9 @@ async function refreshStats() {
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
-const VIEWS = { files: filesView, upload: uploadView, shares: sharesView, account: accountView, users: usersView, jobs: jobsView, audit: auditView };
-const TITLES = { files: 'Files', upload: 'Upload', shares: 'Share links', account: 'Account & security', users: 'Users', jobs: 'Background jobs', audit: 'Audit log' };
-const ADMIN_VIEWS = new Set(['users', 'jobs', 'audit']);
+const VIEWS = { files: filesView, upload: uploadView, shares: sharesView, account: accountView, users: usersView, jobs: jobsView, ai: aiView, audit: auditView };
+const TITLES = { files: 'Files', upload: 'Upload', shares: 'Share links', account: 'Account & security', users: 'Users', jobs: 'Background jobs', ai: 'AI enrichment', audit: 'Audit log' };
+const ADMIN_VIEWS = new Set(['users', 'jobs', 'ai', 'audit']);
 function route() {
   if (!S.token) return showAuth();
   let name = (location.hash.replace(/^#\//, '') || 'files').split('/')[0];
@@ -299,6 +315,7 @@ function openPreview(file) {
 
   const tagsBox = file.status === 'trashed' ? null : el('div', { class: 'tags-box' }, el('span', { class: 'muted', style: 'font-size:12px' }, 'Loading tags…'));
   const metaBox = file.status === 'trashed' ? null : el('div', {});
+  const aiBox = file.status === 'trashed' ? null : el('div', {});
   const info = el('div', { class: 'preview-info' },
     el('h3', {}, file.name),
     el('div', { class: 'muted', style: 'font-size:12px' }, file.path),
@@ -311,6 +328,7 @@ function openPreview(file) {
       el('dt', {}, 'Updated'), el('dd', {}, fmtDate(file.updated_at)),
     ),
     tagsBox,
+    aiBox,
     metaBox,
     file.status === 'trashed'
       ? el('div', { class: 'preview-actions' },
@@ -327,7 +345,120 @@ function openPreview(file) {
   );
   showModal(el('div', {}, el('div', { class: 'preview-media' }, media), info));
   if (tagsBox) loadTags(tagsBox, file);
+  if (aiBox) loadAi(aiBox, file);
   if (metaBox) loadMeta(metaBox, file);
+}
+
+/**
+ * The AI review surface (roadmap 5.8).
+ *
+ * The whole point is that machine output stays visibly machine output: suggested
+ * tags render distinctly from human tags and only become human tags when someone
+ * clicks Accept. Nothing here promotes anything on its own.
+ */
+async function loadAi(box, file) {
+  let status = null;
+  try { status = await api('GET', '/_api/ai/status'); } catch { return; }
+  if (!status.enabled) return; // no provider ⇒ the tab is simply absent
+  const canEdit = S.roles.includes('editor') || isAdmin();
+
+  async function render() {
+    let ai = null;
+    try { ai = (await api('GET', '/_api/files/ai?path=' + encodeURIComponent(file.path))).ai; } catch { /* ignore */ }
+    box.innerHTML = '';
+    const head = el('div', { style: 'display:flex;align-items:center;gap:8px;margin:14px 0 6px' },
+      el('b', {}, '✨ AI'),
+      ai && ai.model ? el('span', { class: 'badge', title: `prompt ${ai.prompt_version}` }, ai.model) : null,
+      ai && ai.confidence != null ? el('span', { class: 'muted', style: 'font-size:12px' }, `confidence ${(ai.confidence * 100).toFixed(0)}%`) : null,
+      el('span', { style: 'flex:1' }),
+      canEdit ? el('button', { class: 'btn btn-sm', onclick: enrich }, ai ? 'Re-run' : 'Enrich') : null,
+    );
+    box.append(head);
+
+    if (!ai) {
+      box.append(el('div', { class: 'muted', style: 'font-size:12px' }, 'Not enriched yet.'));
+      return;
+    }
+    if (ai.status === 'failed') {
+      box.append(el('div', { class: 'form-error' }, ai.error || 'Enrichment failed'));
+      return;
+    }
+    if (ai.status === 'rejected') {
+      box.append(el('div', { class: 'muted', style: 'font-size:12px' }, 'Rejected by a reviewer.'));
+      return;
+    }
+
+    if (ai.caption) box.append(editableLine('Caption', 'caption', ai.caption));
+    if (ai.alt_text) box.append(editableLine('Alt text', 'alt_text', ai.alt_text));
+    if (ai.description) box.append(editableLine('Description', 'description', ai.description));
+    if (ai.summary) box.append(editableLine('Summary', 'summary', ai.summary));
+    if (ai.detected_text) {
+      box.append(el('div', { style: 'margin-top:6px' },
+        el('div', { class: 'muted', style: 'font-size:11px' }, 'Text in image'),
+        el('div', { style: 'font-size:12px;white-space:pre-wrap' }, ai.detected_text.slice(0, 500))));
+    }
+
+    const pending = ai.tags.filter((t) => !t.promoted_at && !t.rejected_at);
+    const promoted = ai.tags.filter((t) => t.promoted_at);
+    if (pending.length) {
+      box.append(el('div', { style: 'margin-top:10px' },
+        el('div', { class: 'muted', style: 'font-size:11px' }, 'Suggested tags — not applied until you accept'),
+        el('div', { class: 'chips' }, ...pending.map((t) => el('span', {
+          class: 'chip', style: 'border-style:dashed', title: t.confidence != null ? `confidence ${t.confidence}` : '',
+        }, '✨ ' + t.tag,
+          canEdit ? el('button', { class: 'chip-x', title: 'Accept as a tag', onclick: () => review('promote_tags', [t.tag]) }, '✓') : null,
+          canEdit ? el('button', { class: 'chip-x', title: 'Reject', onclick: () => review('reject_tags', [t.tag]) }, '×') : null)))));
+      if (canEdit) {
+        box.append(el('div', { class: 'preview-actions', style: 'margin-top:8px' },
+          el('button', { class: 'btn btn-sm btn-primary', onclick: () => review('promote_tags', pending.map((t) => t.tag)) }, 'Accept all'),
+          el('button', { class: 'btn btn-sm', onclick: () => review('reject_tags', pending.map((t) => t.tag)) }, 'Reject all'),
+          el('button', { class: 'btn btn-sm btn-danger', onclick: () => review('reject', []) }, 'Discard enrichment')));
+      }
+    }
+    if (promoted.length) {
+      box.append(el('div', { class: 'muted', style: 'font-size:11px;margin-top:8px' },
+        `${promoted.length} suggestion(s) accepted as tags`));
+    }
+    box.append(el('div', { class: 'muted', style: 'font-size:11px;margin-top:6px' },
+      `${ai.input_tokens + ai.output_tokens} tokens · $${Number(ai.cost_usd).toFixed(4)}`));
+  }
+
+  // A human edit is authoritative — it replaces the generated text in place.
+  function editableLine(label, field, value) {
+    const span = el('div', { style: 'font-size:13px' }, value);
+    const wrap = el('div', { style: 'margin-top:6px' },
+      el('div', { class: 'muted', style: 'font-size:11px' }, label,
+        canEdit ? el('a', { href: '#', style: 'margin-left:6px', onclick: (e) => { e.preventDefault(); edit(); } }, 'edit') : null),
+      span);
+    function edit() {
+      const next = prompt(`${label}:`, value);
+      if (next === null || next === value) return;
+      review('edit', [], { [field]: next });
+    }
+    return wrap;
+  }
+
+  async function review(action, tags, fields) {
+    try {
+      await api('POST', '/_api/files/ai/review', { path: file.path, action, tags, fields });
+      toast('Updated', 'ok');
+      render();
+      const tagsBox = document.querySelector('.tags-box');
+      if (tagsBox) loadTags(tagsBox, file); // promoted tags now show in the human set
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function enrich() {
+    try {
+      await api('POST', '/_api/ai/enrich', { path: file.path });
+      toast('Enrichment queued', 'ok');
+      // The job runs in the background; check back a couple of times.
+      setTimeout(render, 2500);
+      setTimeout(render, 7000);
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  render();
 }
 
 // Render an editable tag chip set into `box` for a file.
@@ -721,6 +852,103 @@ async function accountView(root) {
     if (!confirm(`Revoke "${tk.name}"? Anything using it stops working immediately.`)) return;
     try { await api('DELETE', `/_api/tokens/${tk.id}`); toast('Revoked', 'ok'); loadTokens(); }
     catch (err) { toast(err.message, 'err'); }
+  }
+}
+
+// ── AI view (admin) ──────────────────────────────────────────────────────────
+// Cost accounting and the bulk backfill trigger. Without this, 5.3 and 5.6 are
+// unbudgetable — you cannot approve a run whose price you cannot see.
+async function aiView(root) {
+  const panel = el('div', { class: 'panel' }, el('h3', {}, 'Provider'), el('div', { id: 'ai-status' }, 'Loading…'));
+  const spend = el('div', { class: 'panel' }, el('h3', {}, 'Spend'), el('div', { id: 'ai-spend' }, 'Loading…'));
+  const backfill = el('div', { class: 'panel' },
+    el('h3', {}, 'Backfill'),
+    el('p', { class: 'muted', style: 'font-size:12px;margin:0 0 10px' },
+      'Enrich everything matching a filter through the Message Batches API — half price, and the right ' +
+      'shape for a library rather than a trickle. Assets that already have enrichment are skipped, so this ' +
+      'is safe to re-run and resumes where it left off.'),
+    el('div', { class: 'row' },
+      el('label', {}, 'Folder (optional)', el('input', { id: 'ai-folder', placeholder: 'e.g. gallery' })),
+      el('label', {}, 'Tag (optional)', el('input', { id: 'ai-tag' })),
+      el('label', {}, 'Max assets', el('input', { id: 'ai-limit', type: 'number', min: '1', placeholder: 'batch size' })),
+      el('button', { class: 'btn btn-primary', onclick: startBackfill }, '✨ Start backfill'),
+    ),
+    el('div', { id: 'ai-batches', style: 'margin-top:14px' }),
+  );
+  root.append(panel, spend, backfill);
+  load();
+
+  async function load() {
+    try {
+      const s = await api('GET', '/_api/ai/status');
+      const box = $('#ai-status');
+      box.innerHTML = '';
+      if (!s.enabled) {
+        box.append(el('div', { class: 'muted' }, `⚪ Not configured — ${s.reason}. Set ANTHROPIC_API_KEY to enable.`));
+        $('#ai-spend').textContent = '—';
+        return;
+      }
+      box.append(el('div', {},
+        '🟢 ', el('b', {}, s.model),
+        el('span', { class: 'muted' }, ` · prompt ${s.promptVersion} · images sent at ≤${s.maxImageDim}px`),
+      ), el('div', { class: 'muted', style: 'font-size:12px;margin-top:6px' },
+        `$${s.pricingPerMTok.input}/$${s.pricingPerMTok.output} per million input/output tokens`));
+
+      const u = await api('GET', '/_api/ai/usage');
+      const sp = $('#ai-spend');
+      sp.innerHTML = '';
+      const cap = s.budget.monthlyUsd;
+      const pct = cap ? Math.min(100, Math.round((s.budget.spentThisMonth / cap) * 100)) : null;
+      sp.append(
+        el('div', { class: 'stat-strip' },
+          el('span', {}, el('b', {}, `$${u.monthToDate.toFixed(4)}`), ' this month'),
+          el('span', {}, el('b', {}, `$${u.total.cost.toFixed(4)}`), ' all time'),
+          el('span', {}, el('b', {}, String(u.total.calls)), ' calls'),
+        ),
+        cap
+          ? el('div', { style: 'margin-top:10px' },
+              el('div', { class: 'muted', style: 'font-size:12px' }, `Monthly budget $${cap} — ${pct}% used`),
+              el('div', { class: 'progress', style: 'max-width:320px' },
+                el('span', { style: `width:${pct}%;${pct >= 90 ? 'background:var(--danger)' : ''}` })))
+          : el('div', { class: 'muted', style: 'font-size:12px;margin-top:8px' },
+              '⚠️ No monthly ceiling set. Set AI_MONTHLY_BUDGET_USD before a bulk run.'),
+        u.byKind.length
+          ? el('table', { style: 'margin-top:14px' },
+              el('thead', {}, el('tr', {}, el('th', {}, 'Kind'), el('th', {}, 'Calls'), el('th', {}, 'Cost'))),
+              el('tbody', {}, ...u.byKind.map((k) => el('tr', {},
+                el('td', {}, k.kind), el('td', {}, String(k.calls)), el('td', {}, '$' + k.cost.toFixed(4))))))
+          : null,
+      );
+      renderBatches(u.batches || []);
+    } catch (err) { $('#ai-status').textContent = err.message; }
+  }
+
+  function renderBatches(batches) {
+    const box = $('#ai-batches');
+    box.innerHTML = '';
+    if (!batches.length) return;
+    box.append(el('table', {},
+      el('thead', {}, el('tr', {}, el('th', {}, 'Batch'), el('th', {}, 'State'), el('th', {}, 'Requested'), el('th', {}, 'OK'), el('th', {}, 'Failed'), el('th', {}, 'Started'))),
+      el('tbody', {}, ...batches.map((b) => el('tr', {},
+        el('td', { style: 'font-size:12px' }, b.batch_id),
+        el('td', {}, el('span', { class: 'badge' }, b.state)),
+        el('td', {}, String(b.requested)),
+        el('td', {}, String(b.succeeded)),
+        el('td', {}, String(b.errored)),
+        el('td', {}, fmtDate(b.created_at)),
+      )))));
+  }
+
+  async function startBackfill() {
+    const filter = {};
+    if ($('#ai-folder').value.trim()) filter.folder = $('#ai-folder').value.trim();
+    if ($('#ai-tag').value.trim()) filter.tag = $('#ai-tag').value.trim();
+    const limit = $('#ai-limit').value.trim();
+    try {
+      await api('POST', '/_api/ai/enrich', { filter, ...(limit ? { limit: Number(limit) } : {}) });
+      toast('Backfill queued — watch it in Jobs', 'ok');
+      setTimeout(load, 3000);
+    } catch (err) { toast(err.message, 'err'); }
   }
 }
 
