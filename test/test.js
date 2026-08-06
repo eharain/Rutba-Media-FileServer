@@ -7,7 +7,6 @@
  *
  * Requires: sharp (test dep). Node >= 18 (global fetch).
  */
-const { spawn } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
@@ -15,6 +14,7 @@ const path = require('path');
 const assert = require('assert');
 const sharp = require('sharp');
 const provider = require('../provider/index.js');
+const { Runner, spawnServer, sleep, waitFor } = require('./harness');
 
 const PORT = 8731;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -24,27 +24,19 @@ const MASTER_DIR = path.join(tmp, 'masters');
 const CACHE_DIR = path.join(tmp, 'cache');
 fs.mkdirSync(MASTER_DIR, { recursive: true });
 
-let pass = 0, fail = 0;
-const ok = (name) => { pass++; console.log(`  ✓ ${name}`); };
-const bad = (name, e) => { fail++; console.error(`  ✗ ${name}: ${e && e.message || e}`); };
-async function t(name, fn) { try { await fn(); ok(name); } catch (e) { bad(name, e); } }
+const runner = new Runner('origin suite (no database — proves the gated layers stay off)');
+const t = runner.t.bind(runner);
 
 const status = async (u, o) => (await fetch(u, o)).status;
 const dim = async (u, o) => { const r = await fetch(u, o); const b = Buffer.from(await r.arrayBuffer()); const m = await sharp(b).metadata(); return { code: r.status, ...m, bytes: b.length, ct: r.headers.get('content-type') }; };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// Poll an async predicate until truthy (for fire-and-forget replication).
-const waitFor = async (fn, tries = 50, gap = 50) => { for (let i = 0; i < tries; i++) { try { if (await fn()) return true; } catch {} await sleep(gap); } return false; };
-const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((await fetch(base + '/_health')).ok) return; } catch {} await sleep(100); } };
 
 (async () => {
-  const srv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', MASTER_DIR, CACHE_DIR, UPLOAD_TOKEN: TOKEN, CACHE_MAX_BYTES: '60000', UPLOAD_MAX_BYTES: '100000' },
-    stdio: ['ignore', 'pipe', 'pipe'],
+  // Boot hard-fails on timeout (see harness.js) — one honest error beats a cascade
+  // of assertion failures against a server that never started.
+  const srvH = await spawnServer({
+    port: PORT, label: 'srv',
+    env: { MASTER_DIR, CACHE_DIR, UPLOAD_TOKEN: TOKEN, CACHE_MAX_BYTES: '60000', UPLOAD_MAX_BYTES: '100000' },
   });
-  srv.stderr.on('data', (d) => process.env.DEBUG && console.error('[srv]', d.toString()));
-
-  // wait for health
-  for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE + '/_health')).ok) break; } catch {} await sleep(100); }
 
   try {
     await t('health 200 ok', async () => { const r = await fetch(BASE + '/_health'); assert.equal(r.status, 200); assert.equal(await r.text(), 'ok'); });
@@ -123,8 +115,34 @@ const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((a
       await p.delete({ hash: 'photoA', ext: '.jpg', path: 'general/cover' });
       assert.equal(await status(`${BASE}/general/cover/photoA.jpg`), 404);
     });
+
+    // ── Invariant 1: with no DB configured, every gated surface is ABSENT ──────
+    // This is the guarantee the whole platform layer is built on — adding features
+    // must never change what an unconfigured deployment exposes.
+    await t('no DB: /_api/* is 503 db_disabled, never a working control plane', async () => {
+      const r = await fetch(`${BASE}/_api/auth/me`);
+      assert.equal(r.status, 503);
+      assert.equal((await r.json()).error, 'db_disabled');
+    });
+    await t('no DB: /_ui/ console is absent (404)', async () => {
+      assert.equal(await status(`${BASE}/_ui/`), 404);
+      assert.equal(await status(`${BASE}/_ui/app.js`), 404);
+    });
+    await t('no DB: /_s/ share links are absent (404)', async () => {
+      assert.equal(await status(`${BASE}/_s/0123456789abcdef0123456789abcdef`), 404);
+    });
+    await t('no DB: /_dav/ WebDAV mount is absent (404, no auth challenge)', async () => {
+      const r = await fetch(`${BASE}/_dav/`, { method: 'PROPFIND' });
+      assert.equal(r.status, 404);
+      assert.equal(r.headers.get('www-authenticate'), null, 'must not even challenge for credentials');
+    });
+    await t('no DB: DELETE hard-unlinks (no trash dir is created)', async () => {
+      await fetch(`${BASE}/tmp-del.jpg`, { method: 'PUT', headers: { Authorization: `Bearer ${TOKEN}` }, body: master });
+      assert.equal(await status(`${BASE}/tmp-del.jpg`, { method: 'DELETE', headers: { Authorization: `Bearer ${TOKEN}` } }), 204);
+      assert.ok(!fs.existsSync(path.join(tmp, '.media-trash')), 'trash is a DB-layer feature and must not appear');
+    });
   } finally {
-    srv.kill();
+    srvH.stop();
   }
 
   // ── origin pull-through (separate media server + mock origin) ──────────────
@@ -144,12 +162,10 @@ const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((a
     await new Promise((r) => origin.listen(0, '127.0.0.1', r));
     const oport = origin.address().port;
 
-    const srv2 = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-      env: { ...process.env, PORT: String(PORT2), HOST: '127.0.0.1', MASTER_DIR: M2, CACHE_DIR: C2, UPLOAD_TOKEN: TOKEN, ORIGIN_SOURCES: `http://127.0.0.1:${oport}` },
-      stdio: ['ignore', 'pipe', 'pipe'],
+    const srv2 = await spawnServer({
+      port: PORT2, label: 'srv2',
+      env: { MASTER_DIR: M2, CACHE_DIR: C2, UPLOAD_TOKEN: TOKEN, ORIGIN_SOURCES: `http://127.0.0.1:${oport}` },
     });
-    srv2.stderr.on('data', (d) => process.env.DEBUG && console.error('[srv2]', d.toString()));
-    for (let i = 0; i < 50; i++) { try { if ((await fetch(BASE2 + '/_health')).ok) break; } catch {} await sleep(100); }
 
     try {
       await t('origin: missing master fetched, served & persisted', async () => {
@@ -166,7 +182,7 @@ const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((a
       });
       await t('origin: not present at origin -> 404', async () => { assert.equal(await status(`${BASE2}/notthere.jpg`), 404); });
     } finally {
-      srv2.kill();
+      srv2.stop();
       origin.close();
     }
   })();
@@ -182,19 +198,16 @@ const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((a
     const img = await sharp({ create: { width: 800, height: 500, channels: 3, background: { r: 120, g: 200, b: 90 } } }).jpeg({ quality: 90 }).toBuffer();
 
     // Public node lists the private node as a private peer; private node lists the public node.
-    const pub = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-      env: { ...process.env, PORT: String(PORT_PUB), HOST: '127.0.0.1', MASTER_DIR: M_PUB, CACHE_DIR: C_PUB, UPLOAD_TOKEN: TOKEN,
+    const pub = await spawnServer({
+      port: PORT_PUB, label: 'pub',
+      env: { MASTER_DIR: M_PUB, CACHE_DIR: C_PUB, UPLOAD_TOKEN: TOKEN,
         CLUSTER_ROLE: 'public', CLUSTER_SECRET: SECRET, CLUSTER_PEERS: `${BASE_PRV}|private`, PRIVATE_PATHS: 'private' },
-      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const prv = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-      env: { ...process.env, PORT: String(PORT_PRV), HOST: '127.0.0.1', MASTER_DIR: M_PRV, CACHE_DIR: C_PRV, UPLOAD_TOKEN: TOKEN,
+    const prv = await spawnServer({
+      port: PORT_PRV, label: 'prv',
+      env: { MASTER_DIR: M_PRV, CACHE_DIR: C_PRV, UPLOAD_TOKEN: TOKEN,
         CLUSTER_ROLE: 'private', CLUSTER_SECRET: SECRET, CLUSTER_PEERS: `${BASE_PUB}|public`, PRIVATE_PATHS: 'private' },
-      stdio: ['ignore', 'pipe', 'pipe'],
     });
-    pub.stderr.on('data', (d) => process.env.DEBUG && console.error('[pub]', d.toString()));
-    prv.stderr.on('data', (d) => process.env.DEBUG && console.error('[prv]', d.toString()));
-    await waitHealth(BASE_PUB); await waitHealth(BASE_PRV);
 
     try {
       // A public upload to the private/LAN node replicates UP to the public node.
@@ -232,12 +245,17 @@ const waitHealth = async (base) => { for (let i = 0; i < 50; i++) { try { if ((a
         assert.equal(badR.status, 401);
       });
     } finally {
-      pub.kill(); prv.kill();
+      pub.stop(); prv.stop();
     }
   })();
 
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 
-  console.log(`\n${pass} passed, ${fail} failed`);
-  process.exit(fail ? 1 : 0);
-})();
+  process.exit(runner.finish());
+})().catch((e) => {
+  // A harness-level failure (e.g. the server never booted) is one fact, not N
+  // assertion failures — report it as such and exit non-zero.
+  console.error(`\nFATAL: ${(e && e.stack) || e}`);
+  try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+  process.exit(1);
+});

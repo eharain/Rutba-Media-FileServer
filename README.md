@@ -9,7 +9,8 @@ built for **Hostinger Node.js hosting** (Business Web Hosting, `77.37.37.27`) or
 > - `provider/` — Strapi upload provider (`strapi-provider-upload-media`)
 > - `migrate/` — DB-driven migration (masters-only + `formats` rewrite)
 > - `deploy/` — Dockerfile, compose, Caddy snippet, deploy guide
-> - `test/` — automated suite (`cd test && npm install && node test.js`) — 26/26 passing
+> - `test/` — automated suites: `npm test` (origin, no database) and
+>   `npm run test:platform` (platform layer, needs MySQL)
 > - `nextjs/` — optional `<Image>` custom loader for the drop-formats path
 
 **Why:** Strapi pre-generates `thumbnail_/small_/medium_/large_` variants for every
@@ -185,11 +186,26 @@ nextjs/          # optional <Image> loader
 ## Develop & test
 ```bash
 npm install            # installs sharp at the repo root (the server needs it)
-npm test               # runs the 26-check suite (installs test deps first)
+npm test               # origin suite — no database; proves the gated layers stay off
+npm run test:platform  # platform suite — needs MySQL (see below)
+npm run test:all       # both
 ```
-> The suite spawns `server.js` as its own process, which resolves `sharp` from the
-> **repo root**, so `npm install` at the root is required before `npm test`
-> (CI does this — see `.github/workflows/ci.yml`).
+Each suite prints its own check total, so no comment, README line or CI step can
+drift from the real number.
+
+The platform suite creates a **throwaway database per run and drops it afterwards**,
+so it never touches an existing one. Point it at any MySQL you don't mind it
+connecting to; `DB_NAME` is deliberately ignored:
+```bash
+DB_HOST=127.0.0.1 DB_USER=root DB_PASSWORD=secret npm run test:platform
+```
+With no `DB_HOST` set it prints a skip notice and exits 0, so a machine without
+MySQL still runs `npm test` cleanly.
+
+> Both suites spawn `server.js` as its own process, which resolves `sharp` from the
+> **repo root**, so `npm install` at the root is required first (CI does this — see
+> `.github/workflows/ci.yml`, which runs the two suites as separate jobs across
+> Node 18/20/22).
 
 ## Deploy on Hostinger (hPanel → Node.js app)
 1. **hPanel → `images.rutba.pk` → Node.js** (Setup Node.js App).

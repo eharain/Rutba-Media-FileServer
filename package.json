@@ -10,7 +10,10 @@
   "scripts": {
     "start": "node server.js",
     "pretest": "npm --prefix test install --no-audit --no-fund",
-    "test": "node test/test.js"
+    "test": "node test/test.js",
+    "pretest:platform": "npm --prefix test install --no-audit --no-fund",
+    "test:platform": "node test/platform.js",
+    "test:all": "npm test && npm run test:platform"
   },
   "engines": {
     "node": ">=18"

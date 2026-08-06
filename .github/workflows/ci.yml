@@ -7,7 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  # The DB-less job. This is the guarantee the whole platform layer rests on:
+  # with no database configured the service is the original masters-only origin
+  # and every gated surface (/_api, /_ui, /_s, /_dav, trash) is absent.
+  origin:
+    name: origin suite (no database)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -21,10 +25,55 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
 
-      # Root deps (sharp) — the spawned server.js resolves sharp from the repo root.
+      # Root deps (sharp, ffmpeg-static) — the spawned server.js resolves them from
+      # the repo root.
       - name: Install root dependencies
         run: npm install --no-audit --no-fund
 
-      # Runs the 22-check suite (pretest installs the test workspace's deps).
-      - name: Run tests
+      # The suite prints its own check total; nothing here hardcodes a number.
+      - name: Run the origin suite
         run: npm test
+
+  # The platform-layer job. Needs a real MySQL; each run creates and drops its own
+  # throwaway database.
+  platform:
+    name: platform suite (MySQL)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-password
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci-root-password"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+          --health-start-period=30s
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install root dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run the platform suite
+        env:
+          DB_HOST: 127.0.0.1
+          DB_PORT: '3306'
+          DB_USER: root
+          DB_PASSWORD: ci-root-password
+          # Cold CI runners boot slower than a dev box; the harness hard-fails on
+          # timeout rather than running assertions against a dead server.
+          MEDIA_TEST_BOOT_MS: '90000'
+        run: npm run test:platform
