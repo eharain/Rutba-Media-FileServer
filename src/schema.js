@@ -106,29 +106,45 @@ const STATEMENTS = [
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
   // One row per master. `path` mirrors the on-disk relative path (the URL key).
+  //
+  // Uniqueness is on `path_hash` (sha256 of the FULL path), not on the path column.
+  // A prefix index — `UNIQUE KEY (path(255))` — treats two distinct paths sharing a
+  // 255-char prefix as the same row, and `recordPut`'s ON DUPLICATE KEY UPDATE then
+  // silently overwrites the other file's metadata. `path` keeps a plain (non-unique)
+  // prefix index so `WHERE path = ?` lookups stay fast.
+  //
+  // `volume_id` records WHICH volume holds the bytes, so a read can stat one place
+  // instead of walking every mount, and the scanner can reconcile per volume.
   `CREATE TABLE IF NOT EXISTS files (
      id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
      path            VARCHAR(1024) NOT NULL,
+     path_hash       CHAR(64) NOT NULL,
      name            VARCHAR(255) NOT NULL,
      ext             VARCHAR(32) NULL,
      mime            VARCHAR(128) NULL,
      size_bytes      BIGINT UNSIGNED NOT NULL DEFAULT 0,
+     volume_id       VARCHAR(64) NULL,
+     mtime_ms        BIGINT UNSIGNED NULL,
      checksum_sha256 CHAR(64) NULL,
      width           INT UNSIGNED NULL,
      height          INT UNSIGNED NULL,
      visibility      ENUM('public','private') NOT NULL DEFAULT 'public',
-     status          ENUM('active','trashed') NOT NULL DEFAULT 'active',
+     status          ENUM('active','trashed','missing') NOT NULL DEFAULT 'active',
      owner_user_id   BIGINT UNSIGNED NULL,
      folder_id       BIGINT UNSIGNED NULL,
+     last_scan_id    BIGINT UNSIGNED NULL,
      created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
      updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
      trashed_at      DATETIME NULL,
      PRIMARY KEY (id),
-     UNIQUE KEY uq_files_path (path(255)),
+     UNIQUE KEY uq_files_path_hash (path_hash),
+     KEY idx_files_path (path(255)),
      KEY idx_files_owner (owner_user_id),
      KEY idx_files_folder (folder_id),
      KEY idx_files_status (status),
      KEY idx_files_checksum (checksum_sha256),
+     KEY idx_files_volume (volume_id),
+     KEY idx_files_scan (last_scan_id),
      FULLTEXT KEY ft_files_name (name)
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
@@ -222,6 +238,42 @@ const STATEMENTS = [
      CONSTRAINT fk_comments_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+  // ── Background work ────────────────────────────────────────────────────────
+  // The single queue every asynchronous feature rides on: filesystem scans,
+  // metadata extraction, transcodes, AI enrichment, integrity scrubs, purges.
+  //
+  // A worker claims a job by writing a unique `lease_owner` under an atomic
+  // conditional UPDATE, so several processes can share one queue safely. A crashed
+  // worker's job returns to `queued` when its `lease_until` passes. `dedupe_key` is
+  // unique among LIVE jobs and cleared on completion, so "one scan at a time" needs
+  // no coordination beyond the insert.
+  `CREATE TABLE IF NOT EXISTS jobs (
+     id           BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     type         VARCHAR(64) NOT NULL,
+     payload      JSON NULL,
+     state        ENUM('queued','running','done','failed','cancelled') NOT NULL DEFAULT 'queued',
+     priority     TINYINT NOT NULL DEFAULT 5,
+     attempts     INT UNSIGNED NOT NULL DEFAULT 0,
+     max_attempts INT UNSIGNED NOT NULL DEFAULT 5,
+     run_after    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     lease_until  DATETIME NULL,
+     lease_owner  VARCHAR(80) NULL,
+     dedupe_key   VARCHAR(191) NULL,
+     progress     JSON NULL,
+     result       JSON NULL,
+     error        TEXT NULL,
+     created_by   BIGINT UNSIGNED NULL,
+     created_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     updated_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+     started_at   DATETIME NULL,
+     finished_at  DATETIME NULL,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_jobs_dedupe (dedupe_key),
+     KEY idx_jobs_claim (state, run_after, priority),
+     KEY idx_jobs_type (type),
+     KEY idx_jobs_lease (lease_until)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
   // ── Audit trail ────────────────────────────────────────────────────────────
   `CREATE TABLE IF NOT EXISTS audit_log (
      id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -239,4 +291,75 @@ const STATEMENTS = [
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 ];
 
-module.exports = { STATEMENTS };
+/**
+ * Migrations for databases created by an EARLIER version of the schema above.
+ * `CREATE TABLE IF NOT EXISTS` cannot reshape a table that already exists, so each
+ * entry states a condition and the statements to run when it holds. Conditions are
+ * read from information_schema, which makes every migration idempotent and safe to
+ * re-run on every boot (db.init applies them in order).
+ *
+ * Conditions:
+ *   columnMissing:  [table, column]          — column is not there yet
+ *   indexMissing:   [table, index]           — index is not there yet
+ *   indexPresent:   [table, index]           — index IS there (used for drops)
+ *   columnTypeLacks:[table, column, token]   — the column's type doesn't contain the
+ *                                              token (e.g. a new ENUM member)
+ */
+const MIGRATIONS = [
+  // 2.5 — replace the prefix-based uniqueness on `path` with a real one on the full
+  // path's sha256. Order matters: add + backfill the column, add the unique key,
+  // then drop the old one (so uniqueness is never unenforced in between).
+  {
+    id: 'files.path_hash',
+    if: { columnMissing: ['files', 'path_hash'] },
+    sql: [
+      'ALTER TABLE files ADD COLUMN path_hash CHAR(64) NULL AFTER path',
+      'UPDATE files SET path_hash = SHA2(path, 256) WHERE path_hash IS NULL',
+    ],
+  },
+  {
+    id: 'files.uq_path_hash',
+    if: { indexMissing: ['files', 'uq_files_path_hash'] },
+    sql: ['ALTER TABLE files ADD UNIQUE KEY uq_files_path_hash (path_hash)'],
+  },
+  {
+    id: 'files.idx_path',
+    if: { indexMissing: ['files', 'idx_files_path'] },
+    sql: ['ALTER TABLE files ADD KEY idx_files_path (path(255))'],
+  },
+  {
+    id: 'files.drop_uq_path',
+    if: { indexPresent: ['files', 'uq_files_path'] },
+    sql: ['ALTER TABLE files DROP INDEX uq_files_path'],
+  },
+  // 2.4 — record where the bytes live (plus mtime, for scanner drift detection).
+  {
+    id: 'files.volume_id',
+    if: { columnMissing: ['files', 'volume_id'] },
+    sql: [
+      'ALTER TABLE files ADD COLUMN volume_id VARCHAR(64) NULL AFTER size_bytes',
+      'ALTER TABLE files ADD KEY idx_files_volume (volume_id)',
+    ],
+  },
+  {
+    id: 'files.mtime_ms',
+    if: { columnMissing: ['files', 'mtime_ms'] },
+    sql: ['ALTER TABLE files ADD COLUMN mtime_ms BIGINT UNSIGNED NULL AFTER volume_id'],
+  },
+  // 2.2 — the scanner's generation marker, and the state it puts a vanished file in.
+  {
+    id: 'files.last_scan_id',
+    if: { columnMissing: ['files', 'last_scan_id'] },
+    sql: [
+      'ALTER TABLE files ADD COLUMN last_scan_id BIGINT UNSIGNED NULL AFTER folder_id',
+      'ALTER TABLE files ADD KEY idx_files_scan (last_scan_id)',
+    ],
+  },
+  {
+    id: 'files.status_missing',
+    if: { columnTypeLacks: ['files', 'status', 'missing'] },
+    sql: ["ALTER TABLE files MODIFY COLUMN status ENUM('active','trashed','missing') NOT NULL DEFAULT 'active'"],
+  },
+];
+
+module.exports = { STATEMENTS, MIGRATIONS };

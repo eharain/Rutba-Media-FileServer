@@ -25,6 +25,9 @@ const { createStorage } = require('./storage');
 const { createDb } = require('./db');
 const { createAuth } = require('./auth');
 const { createFileIndex } = require('./fileindex');
+const { createJobs } = require('./jobs');
+const { createScanner } = require('./scanner');
+const { registerJobTypes } = require('./jobtypes');
 const { createTrash } = require('./trash');
 const { createMasterResolver } = require('./resolve');
 const { createReadHandler } = require('./handlers/read');
@@ -41,19 +44,37 @@ function createApp(config) {
   const resizer = new VariantResizer({ sharp, cache });
   const ffmpeg = createFfmpeg(config);
   const media = new MediaVariant({ ffmpeg, sharp, cache });
-  const origin = new OriginFetcher({ sources: config.originSources, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.originTimeoutMs });
-  const cluster = new Cluster({ role: config.clusterRole, peers: config.clusterPeers, secret: config.clusterSecret, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.clusterTimeoutMs });
   // Optional DB-backed layer (accounts / RBAC / metadata / audit). Disabled stub
   // when config.db is null — the handlers below run exactly as before without it.
   const storage = createStorage(config);
   const db = createDb(config);
   const auth = createAuth({ db, config });
-  const index = createFileIndex({ db });
+  const jobs = createJobs({ db, config });
+  const index = createFileIndex({ db, jobs });
+
+  // Pull-through paths (external origin, cluster peer) persist a master without
+  // going through the write handler. `onStored` is what puts those masters in the
+  // index — two of the three ways a served file used to stay invisible to the
+  // platform. Masters are always published into the default volume by fetchstore.
+  const indexPulled = async (hit, source) => {
+    await index.recordDiscovered(hit.rel, {
+      size: hit.stat ? hit.stat.size : 0,
+      mtimeMs: hit.stat ? hit.stat.mtimeMs : null,
+      volumeId: storage.volumes[0].id,
+      visibility: hit.visibility === 'private' ? 'private' : 'public',
+      source,
+    });
+  };
+  const origin = new OriginFetcher({ sources: config.originSources, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.originTimeoutMs, onStored: indexPulled });
+  const cluster = new Cluster({ role: config.clusterRole, peers: config.clusterPeers, secret: config.clusterSecret, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.clusterTimeoutMs, onStored: indexPulled });
+
+  const scanner = createScanner({ config, storage, db, index, jobs });
+  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config });
   const trash = createTrash({ config, db, cluster, storage });
   const resolveMaster = createMasterResolver({ config, storage, origin, cluster });
   const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster, media });
   const handleWrite = createWriteHandler({ config, cache, cluster, storage, index, trash, auth, db, ffmpeg });
-  const handleApi = createApiHandler({ config, db, auth, trash, storage });
+  const handleApi = createApiHandler({ config, db, auth, trash, storage, jobs });
   const handleUi = createUiHandler({ db });
   const handleShare = createShareHandler({ config, db, storage });
   const masterops = createMasterOps({ config, storage, cache, cluster, index, trash, sharp, ffmpeg });
@@ -93,7 +114,7 @@ function createApp(config) {
   });
   server.on('clientError', (err, socket) => { if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'); });
 
-  return { server, cache, resizer, media, ffmpeg, origin, cluster, storage, db, auth, trash, sharp };
+  return { server, cache, resizer, media, ffmpeg, origin, cluster, storage, db, auth, trash, sharp, jobs, scanner, index };
 }
 
 module.exports = { createApp };

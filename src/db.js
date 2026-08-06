@@ -14,7 +14,7 @@
  * still serve.
  */
 
-const { STATEMENTS } = require('./schema');
+const { STATEMENTS, MIGRATIONS } = require('./schema');
 
 let mysql = null;
 try { mysql = require('mysql2/promise'); } catch { /* dependency absent → layer stays off */ }
@@ -67,8 +67,10 @@ function createDb(config) {
           host: cfg.host, port: cfg.port, user: cfg.user, password: cfg.password, database: cfg.database,
           waitForConnections: true, connectionLimit: cfg.connectionLimit, queueLimit: 0, namedPlaceholders: false,
         });
-        // Apply schema in order (each statement is idempotent).
+        // Apply schema in order (each statement is idempotent), then reshape any
+        // table an older version of this file created.
         for (const stmt of STATEMENTS) await pool.query(stmt);
+        await applyMigrations(pool, cfg.database);
         db.enabled = true;
         console.log(`[media] db on — ${cfg.user}@${cfg.host}:${cfg.port}/${cfg.database}`);
       } catch (err) {
@@ -81,6 +83,61 @@ function createDb(config) {
     },
   };
   return db;
+}
+
+/**
+ * Run the schema.js MIGRATIONS whose condition currently holds. Conditions are read
+ * from information_schema, so this is idempotent: on a database already in the
+ * target shape nothing runs and nothing is logged.
+ */
+async function applyMigrations(pool, database) {
+  const has = {
+    async column(table, column) {
+      const [r] = await pool.query(
+        'SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1',
+        [database, table, column]);
+      return r.length > 0;
+    },
+    async index(table, index) {
+      const [r] = await pool.query(
+        'SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND INDEX_NAME=? LIMIT 1',
+        [database, table, index]);
+      return r.length > 0;
+    },
+    async typeContains(table, column, token) {
+      const [r] = await pool.query(
+        'SELECT COLUMN_TYPE AS t FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND TABLE_NAME=? AND COLUMN_NAME=? LIMIT 1',
+        [database, table, column]);
+      return r.length > 0 && String(r[0].t).includes(token);
+    },
+  };
+
+  async function holds(cond) {
+    if (cond.columnMissing) return !(await has.column(...cond.columnMissing));
+    if (cond.indexMissing) return !(await has.index(...cond.indexMissing));
+    if (cond.indexPresent) return has.index(...cond.indexPresent);
+    if (cond.columnTypeLacks) {
+      const [table, column, token] = cond.columnTypeLacks;
+      // A column that doesn't exist yet is handled by its own columnMissing entry.
+      if (!(await has.column(table, column))) return false;
+      return !(await has.typeContains(table, column, token));
+    }
+    return false;
+  }
+
+  for (const m of MIGRATIONS) {
+    let due;
+    try { due = await holds(m.if); } catch (e) { console.warn(`[media] migration ${m.id}: condition check failed (${e.code || e.message})`); continue; }
+    if (!due) continue;
+    try {
+      for (const sql of m.sql) await pool.query(sql);
+      console.log(`[media] db migration applied: ${m.id}`);
+    } catch (e) {
+      // A failed migration must not take the server down — it degrades a feature,
+      // and the condition will still hold next boot so it retries.
+      console.warn(`[media] WARNING: migration ${m.id} failed: ${e.code || e.message}`);
+    }
+  }
 }
 
 // Open the bootstrap connection, retrying up to `cfg.connectRetries` times (1s

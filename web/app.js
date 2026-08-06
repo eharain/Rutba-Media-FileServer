@@ -154,18 +154,22 @@ async function refreshStats() {
       el('span', {}, el('b', {}, fmtBytes(s.storageBytes)), ' stored'),
       el('span', {}, el('b', {}, String(s.users)), ' users'),
       el('span', {}, el('b', {}, String(s.trashed)), ' trashed'),
+      // Only worth screen space when there is something to act on.
+      s.missing ? el('span', { class: 'over', title: 'Indexed files whose bytes are no longer on any volume' }, el('b', {}, String(s.missing)), ' missing') : null,
+      s.jobs && s.jobs.queued ? el('span', { title: 'Queued background jobs' }, el('b', {}, String(s.jobs.queued)), ' queued') : null,
     );
   } catch { /* ignore */ }
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
-const VIEWS = { files: filesView, upload: uploadView, shares: sharesView, users: usersView, audit: auditView };
-const TITLES = { files: 'Files', upload: 'Upload', shares: 'Share links', users: 'Users', audit: 'Audit log' };
+const VIEWS = { files: filesView, upload: uploadView, shares: sharesView, users: usersView, jobs: jobsView, audit: auditView };
+const TITLES = { files: 'Files', upload: 'Upload', shares: 'Share links', users: 'Users', jobs: 'Background jobs', audit: 'Audit log' };
+const ADMIN_VIEWS = new Set(['users', 'jobs', 'audit']);
 function route() {
   if (!S.token) return showAuth();
   let name = (location.hash.replace(/^#\//, '') || 'files').split('/')[0];
   if (!VIEWS[name]) name = 'files';
-  if ((name === 'users' || name === 'audit') && !isAdmin()) name = 'files';
+  if (ADMIN_VIEWS.has(name) && !isAdmin()) name = 'files';
   $$('#nav .nav-item').forEach((a) => a.classList.toggle('active', a.dataset.view === name));
   $('#view-title').textContent = TITLES[name];
   $('#view').innerHTML = '';
@@ -550,6 +554,110 @@ function uploadOne(file, prefix, visibility, list) {
   });
   xhr.addEventListener('error', () => { status.textContent = 'failed'; status.className = 'up-status err'; });
   xhr.send(file);
+}
+
+// ── Jobs view (admin) ────────────────────────────────────────────────────────
+// The window onto background work: what the worker is, what is queued, and the one
+// button an operator actually needs after mounting an existing master directory —
+// "Scan now", which is what makes pre-existing files visible to the whole console.
+async function jobsView(root) {
+  const status = el('div', { class: 'muted', style: 'font-size:13px' }, 'Loading…');
+  const head = el('div', { class: 'panel' },
+    el('h3', {}, 'Worker'),
+    status,
+    el('div', { class: 'preview-actions', style: 'margin-top:12px' },
+      el('button', { class: 'btn btn-primary', onclick: () => queueScan(null) }, '🔄 Scan all volumes'),
+      el('span', { id: 'scan-vols', style: 'display:flex;gap:8px;flex-wrap:wrap' }),
+    ),
+    el('p', { class: 'muted', style: 'font-size:12px;margin:10px 0 0' },
+      'A scan reconciles the filesystem into the index: files copied or mounted in directly are indexed, ' +
+      'drifted sizes are refreshed, and rows whose bytes are gone are marked missing (never deleted). ' +
+      'It is rate-limited so it never starves live requests.'),
+  );
+  const tableWrap = el('div', { class: 'panel' }, el('h3', {}, 'Recent jobs'), el('div', { id: 'jobs-table' }, 'Loading…'));
+  root.append(head, tableWrap);
+
+  let timer = null;
+  await load();
+  // Poll while this view is on screen; the router replaces #view on navigation.
+  timer = setInterval(() => { if (!document.body.contains(tableWrap)) return clearInterval(timer); load(); }, 3000);
+
+  async function load() {
+    try {
+      const r = await api('GET', '/_api/jobs?limit=40');
+      const w = r.worker || {};
+      status.innerHTML = '';
+      status.append(
+        el('span', {}, w.running ? '🟢 running' : '⚪ not running in this process', ` · ${w.concurrency} slot(s) · types: ${(w.types || []).join(', ') || 'none'}`),
+        el('div', { style: 'margin-top:8px;display:flex;gap:12px;flex-wrap:wrap' },
+          ...Object.entries(r.summary || {}).map(([k, v]) => el('span', { class: 'badge' }, `${k}: ${v}`))),
+      );
+      renderVolumeButtons();
+      renderJobs(r.jobs || []);
+    } catch (err) {
+      status.textContent = err.status === 503 ? 'The job queue is not available (no database).' : err.message;
+    }
+  }
+
+  async function renderVolumeButtons() {
+    const box = $('#scan-vols');
+    if (!box || box.childElementCount) return;
+    try {
+      const s = await api('GET', '/_api/storage');
+      if (!s.multi) return;
+      for (const v of s.volumes) box.append(el('button', { class: 'btn btn-sm', onclick: () => queueScan(v.id) }, `Scan ${v.id}`));
+    } catch { /* volume list is a nicety */ }
+  }
+
+  function renderJobs(jobs) {
+    const box = $('#jobs-table');
+    box.innerHTML = '';
+    if (!jobs.length) { box.append(el('div', { class: 'empty' }, el('div', { class: 'big' }, '⚙️'), 'No jobs yet.')); return; }
+    box.append(el('table', {},
+      el('thead', {}, el('tr', {}, el('th', {}, 'ID'), el('th', {}, 'Type'), el('th', {}, 'State'), el('th', {}, 'Detail'), el('th', {}, 'Attempts'), el('th', {}, 'Updated'), el('th', {}, ''))),
+      el('tbody', {}, ...jobs.map((j) => el('tr', {},
+        el('td', {}, String(j.id)),
+        el('td', {}, j.type),
+        el('td', {}, el('span', { class: 'badge' }, stateIcon(j.state) + ' ' + j.state)),
+        el('td', { style: 'font-size:12px;color:var(--muted);max-width:340px;overflow:hidden;text-overflow:ellipsis' }, jobDetail(j)),
+        el('td', {}, `${j.attempts}/${j.max_attempts}`),
+        el('td', {}, fmtDate(j.updated_at)),
+        el('td', {}, jobActions(j)),
+      ))),
+    ));
+  }
+
+  function jobActions(j) {
+    if (j.state === 'queued' || j.state === 'running') {
+      return el('button', { class: 'btn btn-sm', onclick: () => act(`/_api/jobs/${j.id}/cancel`, 'Cancelled') }, 'Cancel');
+    }
+    return el('button', { class: 'btn btn-sm', onclick: () => act(`/_api/jobs/${j.id}/retry`, 'Re-queued') }, 'Retry');
+  }
+
+  async function act(path, okMsg) {
+    try { await api('POST', path, {}); toast(okMsg, 'ok'); load(); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function queueScan(volumeId) {
+    try {
+      await api('POST', '/_api/jobs', { type: 'scan', payload: volumeId ? { volumeId } : {} });
+      toast(volumeId ? `Scan of ${volumeId} queued` : 'Scan queued', 'ok');
+      load();
+    } catch (err) { toast(err.message, 'err'); }
+  }
+}
+
+function stateIcon(s) {
+  return { queued: '⏳', running: '⚙️', done: '✅', failed: '❌', cancelled: '🚫' }[s] || '•';
+}
+function jobDetail(j) {
+  if (j.error) return j.error.split('\n')[0].slice(0, 200);
+  const r = j.result || {};
+  if (j.type === 'scan' && r.seen != null) return `${r.seen} files · +${r.created} new · ~${r.updated} updated · ${r.missing} missing`;
+  if (j.type === 'extract' && r.path) return r.missing ? `${r.path} (bytes not found)` : r.path;
+  const p = j.payload || {};
+  return p.path || (p.volumeId ? `volume ${p.volumeId}` : '');
 }
 
 // ── Users view (admin) ───────────────────────────────────────────────────────

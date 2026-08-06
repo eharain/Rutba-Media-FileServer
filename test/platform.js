@@ -44,6 +44,8 @@ if (!DB.host) {
 }
 // Unique per run so parallel CI jobs never collide.
 const DB_NAME = `media_test_${process.pid}_${crypto.randomBytes(3).toString('hex')}`;
+// The pull-through node's own index (see withPullNode) — nodes don't share a database.
+const DB_NAME_PULL = `${DB_NAME}_pull`;
 
 const PORT = 8741;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -76,10 +78,26 @@ async function api(pathname, { method = 'GET', token = null, json = null, header
   return { status: res.status, body, headers: res.headers };
 }
 
-// Upload a master as a platform user (session/API bearer token) or with UPLOAD_TOKEN.
-async function put(rel, buf, { token = TOKEN, headers = {} } = {}) {
+/**
+ * Upload a master as a platform user (session/API bearer token) or with UPLOAD_TOKEN.
+ *
+ * Indexing is deliberately fire-and-forget — invariant 2 says a database hiccup must
+ * degrade features, never fail a write, so `recordPut` is not awaited before the 201.
+ * A test that reads the index immediately after the response is therefore racing it.
+ * On a successful write we wait for the row instead of assuming it is already there.
+ */
+async function put(rel, buf, { token = TOKEN, headers = {}, awaitIndex = true } = {}) {
   const res = await fetch(`${BASE}/${rel}`, { method: 'PUT', headers: { ...authH(token), ...headers }, body: buf });
-  return { status: res.status, body: await res.text().then((s) => { try { return JSON.parse(s); } catch { return s; } }) };
+  const out = { status: res.status, body: await res.text().then((s) => { try { return JSON.parse(s); } catch { return s; } }) };
+  if (out.status === 201 && awaitIndex) await waitRow(rel, (r) => r && r.status === 'active');
+  return out;
+}
+
+// DELETE a master and wait for the index to reflect the soft-trash.
+async function del(rel, token) {
+  const res = await fetch(`${BASE}/${rel}`, { method: 'DELETE', headers: authH(token) });
+  if (res.status === 204) await waitRow(rel, (r) => !r || r.status === 'trashed');
+  return res.status;
 }
 
 const dav = (rel, opts = {}) => fetch(`${BASE}/_dav/${rel}`, opts);
@@ -97,6 +115,59 @@ async function makeVideo() {
   const okRun = await new Promise((resolve) => execFile(bin, args, { timeout: 60000 }, (err) => resolve(!err)));
   if (!okRun) return null;
   try { return fs.readFileSync(out); } catch { return null; }
+}
+
+/**
+ * Stand up the pieces needed to exercise pull-through indexing, run `fn`, tear down:
+ *
+ *   - a mock external origin serving one master
+ *   - a plain (database-free) media node acting as a cluster peer, holding another
+ *   - a "puller" node that has NEITHER master locally and is pointed at both sources
+ *
+ * The puller gets its OWN throwaway database, mirroring how clustering actually
+ * deploys: nodes replicate files to each other, not database rows, so each runs its
+ * own index and its own job queue.
+ */
+async function withPullNode({ img, img2 }, fn) {
+  const http = require('http');
+  const SECRET = 'pull-cluster-secret';
+  const PEER_PORT = PORT + 1, PULL_PORT = PORT + 2;
+  const peerDir = path.join(tmp, 'peer-masters');
+  const pullDir = path.join(tmp, 'pull-masters');
+  fs.mkdirSync(peerDir, { recursive: true });
+  fs.mkdirSync(pullDir, { recursive: true });
+  fs.writeFileSync(path.join(peerDir, 'from-peer.png'), img2);
+
+  const originSrv = http.createServer((req, res) => {
+    if (req.url.split('?')[0] === '/from-origin.jpg') { res.writeHead(200, { 'Content-Type': 'image/jpeg' }); res.end(img); }
+    else { res.writeHead(404); res.end('no'); }
+  });
+  await new Promise((r) => originSrv.listen(0, '127.0.0.1', r));
+  const originPort = originSrv.address().port;
+
+  let peer = null, puller = null;
+  try {
+    peer = await spawnServer({
+      port: PEER_PORT, label: 'peer',
+      env: { MASTER_DIR: peerDir, CACHE_DIR: path.join(tmp, 'peer-cache'), UPLOAD_TOKEN: TOKEN, CLUSTER_SECRET: SECRET },
+    });
+    puller = await spawnServer({
+      port: PULL_PORT, label: 'puller',
+      env: {
+        MASTER_DIR: pullDir, CACHE_DIR: path.join(tmp, 'pull-cache'), TRASH_DIR: path.join(tmp, 'pull-trash'),
+        UPLOAD_TOKEN: TOKEN,
+        DB_HOST: DB.host, DB_PORT: String(DB.port), DB_USER: DB.user, DB_PASSWORD: DB.password, DB_NAME: DB_NAME_PULL,
+        ORIGIN_SOURCES: `http://127.0.0.1:${originPort}`,
+        CLUSTER_PEERS: `http://127.0.0.1:${PEER_PORT}|public`,
+        CLUSTER_SECRET: SECRET,
+      },
+    });
+    await fn(puller);
+  } finally {
+    if (puller) puller.stop();
+    if (peer) peer.stop();
+    originSrv.close();
+  }
 }
 
 // ── suite ─────────────────────────────────────────────────────────────────────
@@ -442,8 +513,7 @@ async function makeVideo() {
     await t('trash: DELETE retains the bytes outside every served volume', async () => {
       await put('trashme/doc.jpg', img, { token: editorTok });
       assert.equal((await fetch(`${BASE}/trashme/doc.jpg`)).status, 200);
-      const del = await fetch(`${BASE}/trashme/doc.jpg`, { method: 'DELETE', headers: authH(editorTok) });
-      assert.equal(del.status, 204);
+      assert.equal(await del('trashme/doc.jpg', editorTok), 204);
       assert.equal((await fetch(`${BASE}/trashme/doc.jpg`)).status, 404, 'no longer served');
       assert.ok(!fs.existsSync(path.join(MASTER_DIR, 'trashme/doc.jpg')), 'gone from the master volume');
       assert.ok(fs.readdirSync(TRASH_DIR).length > 0, 'retained in TRASH_DIR');
@@ -462,7 +532,7 @@ async function makeVideo() {
     });
 
     await t('trash: purge removes the retained bytes and the row for good', async () => {
-      await fetch(`${BASE}/trashme/doc.jpg`, { method: 'DELETE', headers: authH(editorTok) });
+      await del('trashme/doc.jpg', editorTok);
       assert.equal((await api('/_api/files/purge', { method: 'POST', token: editorTok, json: { path: 'trashme/doc.jpg' } })).status, 200);
       const gone = (await api('/_api/files?status=all&q=trashme', { token: adminTok })).body.files;
       assert.ok(!gone.some((f) => f.path === 'trashme/doc.jpg'), 'row is gone');
@@ -473,7 +543,7 @@ async function makeVideo() {
     await t('trash: empty-trash is admin-only and purges everything trashed', async () => {
       await put('bulk/a.jpg', img, { token: editorTok });
       await put('bulk/b.jpg', img2, { token: editorTok });
-      for (const p of ['bulk/a.jpg', 'bulk/b.jpg']) await fetch(`${BASE}/${p}`, { method: 'DELETE', headers: authH(editorTok) });
+      for (const p of ['bulk/a.jpg', 'bulk/b.jpg']) await del(p, editorTok);
       assert.equal((await api('/_api/trash/empty', { method: 'POST', token: editorTok })).status, 403);
       const r = await api('/_api/trash/empty', { method: 'POST', token: adminTok });
       assert.equal(r.status, 200);
@@ -512,7 +582,7 @@ async function makeVideo() {
     });
 
     await t('storage: delete finds and trashes a master on a non-default volume', async () => {
-      assert.equal((await fetch(`${BASE}/archive/old.jpg`, { method: 'DELETE', headers: authH(editorTok) })).status, 204);
+      assert.equal(await del('archive/old.jpg', editorTok), 204);
       assert.ok(!fs.existsSync(path.join(VOL2_DIR, 'archive/old.jpg')));
       assert.equal((await api('/_api/files/restore', { method: 'POST', token: editorTok, json: { path: 'archive/old.jpg' } })).status, 200);
       assert.equal((await fetch(`${BASE}/archive/old.jpg`)).status, 200);
@@ -606,8 +676,9 @@ async function makeVideo() {
       assert.equal(got.status, 200);
       assert.equal(got.buf.length, img2.length);
       assert.equal((await dav('dav/new.png', { method: 'PUT', headers: h, body: img2 })).status, 204);
-      // …and it is indexed like any other write.
-      assert.ok((await api('/_api/files?q=dav/new.png', { token: adminTok })).body.files.length === 1);
+      // …and it is indexed like any other write (asynchronously, as always).
+      await waitRow('dav/new.png', (r) => r && r.status === 'active');
+      assert.equal((await api('/_api/files?q=dav/new.png', { token: adminTok })).body.files.length, 1);
     });
 
     await t('dav: a viewer-only account is refused write verbs (403) but may read', async () => {
@@ -633,6 +704,7 @@ async function makeVideo() {
       assert.equal(r.status, 201);
       assert.equal((await fetch(`${BASE}/davdir/moved.png`)).status, 200);
       assert.equal((await fetch(`${BASE}/dav/new.png`)).status, 404);
+      await waitRow('davdir/moved.png', (r) => !!r);
       const idx = await api('/_api/files?q=moved.png', { token: adminTok });
       assert.equal(idx.body.total, 1);
       assert.equal(idx.body.files[0].path, 'davdir/moved.png');
@@ -646,6 +718,7 @@ async function makeVideo() {
       const b = await bytes(`${BASE}/davdir/copy.png`);
       assert.equal(b.status, 200);
       assert.ok(a.buf.equals(b.buf));
+      await waitRow('davdir/copy.png', (r) => r && r.status === 'active');
       assert.equal((await api('/_api/files?q=copy.png', { token: adminTok })).body.total, 1);
     });
 
@@ -703,6 +776,228 @@ async function makeVideo() {
       assert.match(await r.text(), /<script/);
       assert.equal((await fetch(`${BASE}/_ui/app.js`)).status, 200);
       assert.equal((await fetch(`${BASE}/_ui/../server.js`)).status, 404, 'no traversal out of web/');
+      const shell = await (await fetch(`${BASE}/_ui/`)).text();
+      assert.match(shell, /data-view="jobs"/, 'the console exposes the background-jobs view');
+    });
+
+    // ── index integrity: the path-collision bug ───────────────────────────────
+    await t('index: two paths sharing a 255-char prefix get their own rows', async () => {
+      // The old uniqueness key was `path(255)`. These two paths are identical for the
+      // first 255 characters, so the upsert treated them as one row and the second
+      // upload silently overwrote the first file's metadata with no error at all.
+      // Built from many short segments: a single 260-char component is longer than
+      // any filesystem allows, but a deep path of that total length is ordinary.
+      const stem = 'collide/' + Array(30).fill('abcdefgh').join('/');
+      assert.ok(stem.length > 255, `the shared prefix must exceed the old 255-char key (${stem.length})`);
+      const a = `${stem}/A.jpg`;
+      const b = `${stem}/B.jpg`;
+      assert.equal(a.slice(0, 255), b.slice(0, 255), 'the two paths really do share a 255-char prefix');
+      assert.equal((await put(a, img, { token: editorTok })).status, 201);
+      assert.equal((await put(b, img2, { token: editorTok })).status, 201);
+      const rowA = await fileRow(a);
+      const rowB = await fileRow(b);
+      assert.ok(rowA && rowB, 'both files are indexed');
+      assert.notEqual(rowA.id, rowB.id, 'as two distinct rows');
+      assert.equal(Number(rowA.size_bytes), img.length, "the first file's metadata survived");
+      assert.equal(Number(rowB.size_bytes), img2.length);
+      assert.notEqual(rowA.path_hash, rowB.path_hash);
+    });
+
+    await t('index: every row records the volume its bytes are on', async () => {
+      assert.equal((await fileRow('gallery/blue.jpg')).volume_id, 'default');
+      assert.equal((await fileRow('archive/old.jpg')).volume_id, 'vol2', 'routed writes record the routed volume');
+    });
+
+    // ── background jobs ───────────────────────────────────────────────────────
+    await t('jobs: the queue is admin-only and reports its worker', async () => {
+      assert.equal((await api('/_api/jobs', { token: editorTok })).status, 403);
+      const r = await api('/_api/jobs', { token: adminTok });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.worker.running, true);
+      assert.ok(r.body.worker.types.includes('scan'));
+      assert.ok(r.body.worker.types.includes('extract'));
+      assert.ok(r.body.summary);
+    });
+
+    await t('jobs: only whitelisted types may be queued over HTTP', async () => {
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'rm -rf' } });
+      assert.equal(r.status, 400);
+      assert.equal(r.body.error, 'bad_type');
+    });
+
+    await t('jobs: an extract job runs and records metadata for a file that had none', async () => {
+      // Drop a master straight onto the volume, index it WITHOUT metadata, then let
+      // the queue fill it in — the scanned/pulled-in file's path.
+      fs.writeFileSync(path.join(MASTER_DIR, 'jobbed.png'), img2);
+      const conn = await inspectConn();
+      await conn.query(
+        "INSERT INTO files (path, path_hash, name, ext, mime, size_bytes, volume_id) VALUES (?, SHA2(?,256), 'jobbed.png', '.png', 'image/png', ?, 'default')",
+        ['jobbed.png', 'jobbed.png', img2.length]);
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'extract', payload: { path: 'jobbed.png' } } });
+      assert.equal(r.status, 202);
+      const finished = await waitJob(r.body.job.id);
+      assert.equal(finished.state, 'done', `job error: ${finished.error}`);
+      const md = await api('/_api/files/metadata?path=jobbed.png', { token: adminTok });
+      assert.equal(md.body.metadata.width, 400);
+      assert.equal(md.body.metadata.format, 'png');
+      assert.equal((await fileRow('jobbed.png')).width, 400);
+    });
+
+    await t('jobs: extraction of vanished bytes reports and stops, instead of retrying forever', async () => {
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'extract', payload: { path: 'never/existed.jpg' } } });
+      const finished = await waitJob(r.body.job.id);
+      assert.equal(finished.state, 'done');
+      assert.equal(Number(finished.attempts), 1, 'a genuinely absent file is not retried');
+      assert.equal(jsonOf(finished.result).missing, true);
+    });
+
+    await t('jobs: re-queuing live work returns the same job (dedupe)', async () => {
+      const a = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'extract', payload: { path: 'gallery/blue.jpg' } } });
+      const b = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'extract', payload: { path: 'gallery/blue.jpg' } } });
+      assert.equal(a.status, 202);
+      // Either the second call joined the first job, or the first already finished
+      // and released its dedupe key — both are correct; two LIVE duplicates are not.
+      const sameOrFinished = b.body.job.id === a.body.job.id || (await waitJob(a.body.job.id)).state === 'done';
+      assert.ok(sameOrFinished);
+      await waitJob(b.body.job.id);
+    });
+
+    await t('jobs: a job can be inspected, and retried after it finishes', async () => {
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'extract', payload: { path: 'gallery/blue.jpg' } } });
+      const id = r.body.job.id;
+      await waitJob(id);
+      const one = await api(`/_api/jobs/${id}`, { token: adminTok });
+      assert.equal(one.status, 200);
+      assert.equal(one.body.job.type, 'extract');
+      assert.equal((await api(`/_api/jobs/${id}/retry`, { method: 'POST', token: adminTok })).status, 200);
+      await waitJob(id);
+      assert.equal((await api(`/_api/jobs/999999`, { token: adminTok })).status, 404);
+    });
+
+    // ── the scanner ───────────────────────────────────────────────────────────
+    await t('scan: masters placed directly on disk are indexed by a scan', async () => {
+      // Exactly the deploy shortcut docker-compose.yml recommends: bytes appear on a
+      // volume without ever passing through the write path. Before the scanner these
+      // were served correctly and were invisible to the entire platform.
+      fs.mkdirSync(path.join(MASTER_DIR, 'rsynced/deep'), { recursive: true });
+      fs.writeFileSync(path.join(MASTER_DIR, 'rsynced/one.jpg'), img);
+      fs.writeFileSync(path.join(MASTER_DIR, 'rsynced/deep/two.png'), img2);
+      fs.writeFileSync(path.join(VOL2_DIR, 'rsynced-vol2.jpg'), img);
+      assert.equal(await fileRow('rsynced/one.jpg'), null, 'invisible before the scan');
+
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'scan' } });
+      assert.equal(r.status, 202);
+      const done = await waitJob(r.body.job.id);
+      assert.equal(done.state, 'done', `scan error: ${done.error}`);
+      const result = jsonOf(done.result);
+      assert.ok(result.seen >= 3);
+      assert.ok(result.created >= 3, `expected at least 3 new rows, got ${result.created}`);
+
+      assert.ok(await fileRow('rsynced/one.jpg'), 'top-level file indexed');
+      assert.ok(await fileRow('rsynced/deep/two.png'), 'nested file indexed');
+      const v2 = await fileRow('rsynced-vol2.jpg');
+      assert.ok(v2, 'file on the second volume indexed');
+      assert.equal(v2.volume_id, 'vol2', 'attributed to the volume it was found on');
+      assert.equal((await api('/_api/files?q=rsynced', { token: adminTok })).body.total >= 3, true);
+    });
+
+    await t('scan: the extraction queued for scanned-in files fills their metadata', async () => {
+      await waitFor(async () => {
+        const md = await api('/_api/files/metadata?path=rsynced/deep/two.png', { token: adminTok });
+        return md.body.metadata && md.body.metadata.width === 400;
+      }, 100, 100);
+      const md = await api('/_api/files/metadata?path=rsynced/deep/two.png', { token: adminTok });
+      assert.equal(md.body.metadata.width, 400, 'scanned-in files get the same metadata as uploaded ones');
+    });
+
+    await t('scan: internal artifacts are never indexed', async () => {
+      fs.writeFileSync(path.join(MASTER_DIR, 'sidecar-test.jpg'), img);
+      fs.writeFileSync(path.join(MASTER_DIR, 'sidecar-test.jpg.vis'), 'private');
+      fs.writeFileSync(path.join(MASTER_DIR, 'half-written.up.999.tmp'), img);
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'scan' } });
+      await waitJob(r.body.job.id);
+      assert.ok(await fileRow('sidecar-test.jpg'), 'the master itself is indexed');
+      assert.equal(await fileRow('sidecar-test.jpg.vis'), null, 'visibility sidecars are internal');
+      assert.equal(await fileRow('half-written.up.999.tmp'), null, 'upload temp files are internal');
+    });
+
+    await t('scan: a row whose bytes vanished is marked missing, not deleted', async () => {
+      // Tag it first, to prove the row (and everything hanging off it) is retained.
+      await api('/_api/files/tags', { method: 'PUT', token: editorTok, json: { path: 'rsynced/one.jpg', tags: ['keepme'] } });
+      fs.unlinkSync(path.join(MASTER_DIR, 'rsynced/one.jpg'));
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'scan' } });
+      const done = await waitJob(r.body.job.id);
+      assert.equal(done.state, 'done');
+      const row = await fileRow('rsynced/one.jpg');
+      assert.ok(row, 'the row is kept — it carries tags, shares and comments');
+      assert.equal(row.status, 'missing');
+      assert.deepEqual((await api('/_api/files/tags?path=rsynced/one.jpg', { token: adminTok })).body.tags, ['keepme']);
+      const listed = await api('/_api/files?status=missing', { token: adminTok });
+      assert.ok(listed.body.files.some((f) => f.path === 'rsynced/one.jpg'));
+      assert.ok((await api('/_api/stats', { token: adminTok })).body.missing >= 1);
+    });
+
+    await t('scan: restoring the bytes brings the row back to active', async () => {
+      fs.writeFileSync(path.join(MASTER_DIR, 'rsynced/one.jpg'), img);
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'scan' } });
+      await waitJob(r.body.job.id);
+      assert.equal((await fileRow('rsynced/one.jpg')).status, 'active');
+    });
+
+    await t('scan: a second scan finds no new work (idempotent)', async () => {
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'scan' } });
+      const done = await waitJob(r.body.job.id);
+      const result = jsonOf(done.result);
+      assert.equal(result.created, 0, 'nothing is re-created on a repeat scan');
+      assert.equal(result.missing, 0, 'and nothing is wrongly marked missing');
+      assert.ok(result.unchanged > 0);
+    });
+
+    await t('scan: a single-volume scan never marks the other volume missing', async () => {
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'scan', payload: { volumeId: 'vol2' } } });
+      const done = await waitJob(r.body.job.id);
+      const result = jsonOf(done.result);
+      assert.deepEqual(result.volumes, ['vol2']);
+      assert.equal(result.missing, 0, 'a scoped scan must not finalize across volumes');
+      assert.equal((await fileRow('gallery/blue.jpg')).status, 'active');
+    });
+
+    // ── pull-through indexing ─────────────────────────────────────────────────
+    // The other two ways a served master used to stay invisible: fetched from an
+    // external origin, or pulled from a cluster peer on miss. Both persist bytes via
+    // fetchstore, which never told the index anything. A separate node (sharing this
+    // throwaway database) exercises both without disturbing the main server.
+    await withPullNode({ img, img2 }, async (pull) => {
+      await t('pull-through: an origin-fetched master is indexed, not just served', async () => {
+        const got = await bytes(`${pull.base}/from-origin.jpg`);
+        assert.equal(got.status, 200);
+        assert.equal(got.buf.length, img.length);
+        const row = await waitRow('from-origin.jpg', (r) => !!r, 120, 50, DB_NAME_PULL);
+        assert.equal(row.status, 'active');
+        assert.equal(Number(row.size_bytes), img.length);
+        assert.equal(row.volume_id, 'default', 'pulled masters land on the default volume');
+      });
+
+      await t('pull-through: an origin-fetched master gets its metadata extracted too', async () => {
+        const row = await waitRow('from-origin.jpg', (r) => r && r.width === 900, 200, 100, DB_NAME_PULL);
+        assert.equal(row.width, 900, 'the queued extraction filled in the dimensions');
+        assert.equal(row.height, 600);
+      });
+
+      await t('pull-through: a master pulled from a cluster peer is indexed', async () => {
+        const got = await bytes(`${pull.base}/from-peer.png`);
+        assert.equal(got.status, 200);
+        assert.equal(got.buf.length, img2.length);
+        const row = await waitRow('from-peer.png', (r) => !!r, 120, 50, DB_NAME_PULL);
+        assert.equal(Number(row.size_bytes), img2.length);
+        assert.equal(row.mime, 'image/png');
+      });
+
+      await t('pull-through: a miss at every source stays a 404 and indexes nothing', async () => {
+        assert.equal((await fetch(`${pull.base}/nowhere.jpg`)).status, 404);
+        await sleep(300);
+        assert.equal(await fileRow('nowhere.jpg', DB_NAME_PULL), null);
+      });
     });
 
     // ── unknown routes ────────────────────────────────────────────────────────
@@ -730,21 +1025,71 @@ async function withDbConn(fn) {
   try { return await fn(conn); } finally { await conn.end().catch(() => {}); }
 }
 
+// A long-lived connection for inspecting the throwaway database directly (polling
+// the index, forcing a share's expiry). Cheaper than reconnecting per poll.
+const inspectConns = new Map();
+async function inspectConn(database = DB_NAME) {
+  if (inspectConns.has(database)) return inspectConns.get(database);
+  const mysql = require('mysql2/promise');
+  const conn = await mysql.createConnection({ host: DB.host, port: DB.port, user: DB.user, password: DB.password, database });
+  inspectConns.set(database, conn);
+  return conn;
+}
+async function fileRow(rel, database = DB_NAME) {
+  const conn = await inspectConn(database);
+  const [rows] = await conn.query('SELECT * FROM files WHERE path = ? LIMIT 1', [rel]);
+  return rows[0] || null;
+}
+async function jobRow(id) {
+  const conn = await inspectConn();
+  const [rows] = await conn.query('SELECT * FROM jobs WHERE id = ? LIMIT 1', [Number(id)]);
+  return rows[0] || null;
+}
+// MySQL JSON columns arrive already parsed on some driver versions and as a string
+// on others — normalize rather than guessing.
+function jsonOf(v) {
+  if (v == null) return null;
+  if (typeof v === 'object') return v;
+  try { return JSON.parse(v); } catch { return null; }
+}
+// Poll the index until `pred` holds for `rel`, or give up with a useful message.
+async function waitRow(rel, pred, tries = 120, gap = 50, database = DB_NAME) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    last = await fileRow(rel, database).catch(() => null);
+    if (pred(last)) return last;
+    await sleep(gap);
+  }
+  throw new Error(`index never reached the expected state for "${rel}" (last: ${last ? JSON.stringify({ status: last.status, size: String(last.size_bytes) }) : 'no row'})`);
+}
+// Poll a job until it leaves the queue.
+async function waitJob(id, tries = 300, gap = 100) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    last = await jobRow(id).catch(() => null);
+    if (last && ['done', 'failed', 'cancelled'].includes(last.state)) return last;
+    await sleep(gap);
+  }
+  throw new Error(`job ${id} never finished (last state: ${last ? last.state : 'unknown'})`);
+}
+
 // Push a share's expiry into the past so the serve-side expiry check can be proven.
 async function expireShare(token) {
-  await withDbConn(async (conn) => {
-    await conn.query(`USE \`${DB_NAME}\``);
-    await conn.query('UPDATE shares SET expires_at = DATE_SUB(NOW(), INTERVAL 1 DAY) WHERE token = ?', [token]);
-  });
+  const conn = await inspectConn();
+  await conn.query('UPDATE shares SET expires_at = DATE_SUB(NOW(), INTERVAL 1 DAY) WHERE token = ?', [token]);
 }
 
 let dropped = false;
 async function dropDatabase() {
   if (dropped) return;
   dropped = true;
-  try {
-    await withDbConn((conn) => conn.query(`DROP DATABASE IF EXISTS \`${DB_NAME}\``));
-  } catch (e) {
-    console.warn(`[test] WARNING: could not drop ${DB_NAME}: ${e.code || e.message}`);
+  for (const conn of inspectConns.values()) await conn.end().catch(() => {});
+  inspectConns.clear();
+  for (const name of [DB_NAME, DB_NAME_PULL]) {
+    try {
+      await withDbConn((conn) => conn.query(`DROP DATABASE IF EXISTS \`${name}\``));
+    } catch (e) {
+      console.warn(`[test] WARNING: could not drop ${name}: ${e.code || e.message}`);
+    }
   }
 }

@@ -78,6 +78,15 @@ function pathHash(rel) {
   return crypto.createHash('sha1').update(rel.replace(/\\/g, '/')).digest('hex').slice(0, 16);
 }
 
+// Full-strength hash of a relative path — the `files.path_hash` uniqueness key.
+// Deliberately the untruncated sha256 of the whole path: the index used to be unique
+// on `path(255)`, so two long paths sharing a prefix collided and one row silently
+// overwrote the other. Matches MySQL's `SHA2(path, 256)` so the column can be
+// backfilled in SQL.
+function pathKey(rel) {
+  return crypto.createHash('sha256').update(String(rel).replace(/\\/g, '/')).digest('hex');
+}
+
 // Resolve `relPath` under `root`, rejecting anything that escapes it (path traversal).
 // Returns the absolute path, or null if unsafe / undecodable.
 function resolveSafe(root, relPath) {
@@ -95,4 +104,4 @@ function relOf(root, abs) {
   return path.relative(root, abs).replace(/\\/g, '/');
 }
 
-module.exports = { userHome, expandHome, clampInt, parseVariants, parseList, parsePeers, swapExt, pathHash, resolveSafe, relOf };
+module.exports = { userHome, expandHome, clampInt, parseVariants, parseList, parsePeers, swapExt, pathHash, pathKey, resolveSafe, relOf };

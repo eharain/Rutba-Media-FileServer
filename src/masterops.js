@@ -44,7 +44,8 @@ function createMasterOps({ config, storage, cache, cluster, index, trash, sharp,
     } catch (e) { await fsp.unlink(tmp).catch(() => {}); throw e; }
 
     const checksum = hash.digest('hex');
-    let size = 0; try { size = (await fsp.stat(dest)).size; } catch { /* ignore */ }
+    let size = 0, mtimeMs = null;
+    try { const st = await fsp.stat(dest); size = st.size; mtimeMs = st.mtimeMs; } catch { /* ignore */ }
     const visibility = visOf(rel);
     await cache.purgeForPath(rel);
     if (cluster && cluster.enabled) cluster.replicatePut(rel, dest, visibility);
@@ -56,8 +57,8 @@ function createMasterOps({ config, storage, cache, cluster, index, trash, sharp,
     } else if (ffmpeg && ffmpeg.enabled && /^(video|audio)\//.test(MIME[ext] || '')) {
       try { const pr = await ffmpeg.probe(dest); if (pr) { width = pr.width; height = pr.height; mdata = normalizeProbe(pr); } } catch { /* ignore */ }
     }
-    index.recordPut(rel, { size, visibility, ownerUserId: actingUser ? actingUser.id : null, checksum, width, height, metadata: mdata }, meta);
-    return { size, checksum };
+    index.recordPut(rel, { size, visibility, ownerUserId: actingUser ? actingUser.id : null, checksum, width, height, metadata: mdata, volumeId: place.volumeId, mtimeMs }, meta);
+    return { size, checksum, volumeId: place.volumeId };
   }
 
   // Trash-aware delete of a single master.
@@ -82,6 +83,8 @@ function createMasterOps({ config, storage, cache, cluster, index, trash, sharp,
       try { await fsp.rename(srcAbs, place.abs); }
       catch (e) { if (e.code !== 'EXDEV') throw e; await fsp.copyFile(srcAbs, place.abs); await fsp.unlink(srcAbs).catch(() => {}); }
       await index.renamePath(srcRel, dstRel);
+      // A move may land on a different volume than the source was on.
+      if (index.recordVolume) await index.recordVolume(dstRel, place.volumeId);
       await cache.purgeForPath(srcRel); await cache.purgeForPath(dstRel);
       if (cluster && cluster.enabled) { cluster.replicatePut(dstRel, place.abs, visOf(dstRel)); cluster.replicateDelete(srcRel, visOf(srcRel)); }
     } else {

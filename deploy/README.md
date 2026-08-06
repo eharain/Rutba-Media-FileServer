@@ -40,7 +40,7 @@ deletes — `TRASH_DIR=/data/trash` is set explicitly for exactly this reason). 
 
 **Pre-existing masters.** Files copied or mounted in directly are served correctly but
 are invisible to the index until they are scanned. After bringing up full-platform
-mode over an existing master directory, run a scan (console → Storage → *Scan
+mode over an existing master directory, run a scan (console → **Jobs** → *Scan all
 volumes*, or `POST /_api/jobs` with `{"type":"scan"}`), or set `SCAN_ON_BOOT=1`.
 Add `Caddyfile.snippet` to the edge Caddy and reload:
 ```

@@ -126,10 +126,12 @@ function createWriteHandler({ config, cache, cluster, storage = null, index = NO
     // a single-volume setup this is always the default (masterDir), so behavior is
     // unchanged.
     let dest = dest0;
+    let volumeId = storage ? storage.volumes[0].id : null;
     if (storage) {
       const place = await storage.placeWrite(rel, { sizeHint: Number.isFinite(declared) ? declared : 0 });
       if (!place) return send(res, 507, 'Insufficient Storage');
       dest = place.abs;
+      volumeId = place.volumeId;
     }
 
     await fsp.mkdir(path.dirname(dest), { recursive: true });
@@ -159,9 +161,9 @@ function createWriteHandler({ config, cache, cluster, storage = null, index = NO
       return send(res, 500, 'Upload failed');
     }
     const checksum = tooLarge ? null : hash.digest('hex');
-    // Stat for the actual size (a stat failure just leaves size 0).
-    let size = 0;
-    try { size = (await fsp.stat(dest)).size; } catch { /* ignore */ }
+    // Stat for the actual size and mtime (a stat failure just leaves size 0).
+    let size = 0, mtimeMs = null;
+    try { const st = await fsp.stat(dest); size = st.size; mtimeMs = st.mtimeMs; } catch { /* ignore */ }
     // Quota post-check (backstops chunked uploads with no Content-Length). Roll the
     // just-written master back so it is never served, replicated, or indexed.
     if (quotaBytes != null && usageExcl + size > quotaBytes) {
@@ -184,8 +186,10 @@ function createWriteHandler({ config, cache, cluster, storage = null, index = NO
     } else if (ffmpeg && ffmpeg.enabled && /^(video|audio)\//.test(MIME[relExt] || '')) {
       try { const pr = await ffmpeg.probe(dest); if (pr) { width = pr.width; height = pr.height; imgMeta = normalizeProbe(pr); } } catch { /* ignore */ }
     }
-    // Best-effort metadata index + audit (no-op without a DB).
-    index.recordPut(rel, { size, visibility, ownerUserId: actingUser ? actingUser.id : null, checksum, width, height, metadata: imgMeta }, meta);
+    // Best-effort metadata index + audit (no-op without a DB). `volumeId` records
+    // WHERE the bytes landed, so a read can go straight to that volume instead of
+    // stat-ing every mount in turn.
+    index.recordPut(rel, { size, visibility, ownerUserId: actingUser ? actingUser.id : null, checksum, width, height, metadata: imgMeta, volumeId, mtimeMs }, meta);
     res.writeHead(201, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, path: '/' + rel, visibility }));
   };

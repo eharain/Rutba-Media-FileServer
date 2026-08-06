@@ -42,6 +42,13 @@ keeps running with the layer **off** (masters still serve).
 | `DB_NAME` / `MYSQL_DATABASE` | `media` | Database (auto-created) |
 | `DB_URL` / `MYSQL_URL` / `DATABASE_URL` | — | Connection URL (overrides discrete vars) |
 | `DB_POOL` | `10` | Pool connection limit |
+| `DB_CONNECT_RETRIES` | `0` | Boot-time connect retries, 1s apart, before degrading to origin-only. Raise it when the database starts alongside the server (compose). |
+| `JOBS_ENABLED` | `true` | Run the background worker in this process |
+| `JOBS_CONCURRENCY` | `2` | Jobs run at once |
+| `JOBS_POLL_MS` | `1000` | Queue poll interval |
+| `JOBS_MAX_ATTEMPTS` | `5` | Attempts before a job is failed for good |
+| `SCAN_ON_BOOT` | `false` | Reconcile the filesystem into the index once at boot |
+| `SCAN_RATE_FILES_PER_SEC` | `200` | Ceiling on scan throughput, so it never starves request-path I/O |
 | `ALLOW_REGISTRATION` | `false` | Allow open self-service `POST /_api/auth/register`. The **first** account is always allowed (bootstrap admin) regardless. |
 | `SESSION_TTL_DAYS` | `30` | Login session lifetime |
 | `READ_AUTH_MODE` | `public` | `public` (open, as today) · `mixed` (private files need auth) · `private` (all reads need auth). *Reserved — enforcement lands with the read-auth phase; currently reads stay public.* |
@@ -118,10 +125,72 @@ namespace never collides with media paths (like `/_health`).
 | `POST /_api/files/purge` | editor | Permanently delete a trashed file `{path}` |
 | `POST /_api/trash/empty` | admin | Permanently delete everything in the trash |
 | `GET  /_api/audit` | admin | Recent audit events |
-| `GET  /_api/stats` | admin | File count, storage bytes, trashed, users |
+| `GET  /_api/stats` | admin | File count, storage bytes, trashed, missing, users, job summary |
 | `GET  /_api/storage` | admin | Storage volumes with free/total space + placement policy |
+| `GET  /_api/jobs` | admin | Background jobs: `?state=&type=&limit=&offset=` + worker info |
+| `POST /_api/jobs` | admin | Queue a job `{type, payload?}` → `202 {job}` |
+| `GET  /_api/jobs/:id` | admin | One job with its progress/result |
+| `POST /_api/jobs/:id/cancel` | admin | Cancel a queued or running job |
+| `POST /_api/jobs/:id/retry` | admin | Re-queue a finished job with attempts reset |
 
 ¹ First account always allowed; subsequent self-registration needs `ALLOW_REGISTRATION=true`.
+
+## The index, and the scan that completes it
+
+Every master gets a row in `files` — that row is what search, tags, shares, quotas,
+duplicates and the console all read. Rows are keyed by `path_hash` (the sha256 of the
+full path) and record which storage `volume_id` holds the bytes.
+
+**A row is created by every way a master can arrive:** an HTTP `PUT`, a WebDAV write,
+an origin pull-through, a cluster peer pull — and, for bytes that appeared on disk
+without passing through the server at all, by a **scan**.
+
+That last case is the common one in a real deployment: masters copied in with rsync,
+restored from a backup, or a Strapi uploads volume mounted straight in. Those files
+are served correctly but are invisible to the platform until they are indexed:
+
+```bash
+curl -X POST https://media.example.com/_api/jobs \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"type":"scan"}'
+```
+or console → **Jobs** → *Scan all volumes*, or `SCAN_ON_BOOT=1` to reconcile once at
+every boot.
+
+A scan walks every volume and reconciles it against the index:
+
+| On disk | In the index | Result |
+|---|---|---|
+| present | absent | indexed, and queued for metadata extraction |
+| present, size/mtime changed | present | row refreshed, metadata re-extracted |
+| absent | present | marked **`missing`** — never deleted |
+
+`missing` is deliberately not a delete: the row may carry tags, share links and
+comments, and the bytes may simply be on an unmounted volume. Restore the file and
+the next scan flips it back to `active`. List them with `/_api/files?status=missing`.
+
+Scans are **resumable** (a killed scan continues from its recorded progress rather
+than starting over) and **rate-limited** (`SCAN_RATE_FILES_PER_SEC`) so reconciling a
+large library never starves live requests.
+
+## Background jobs
+
+One queue carries everything that must not block a request: scans, metadata
+extraction, and the transcode/enrichment/scrub work that later phases add.
+
+- **Gated twice.** No database ⇒ no queue at all. `JOBS_ENABLED=0` keeps the queue
+  (jobs can be enqueued and inspected) but runs nothing in *this* process.
+- **Crash-safe.** A worker claims a job under a lease; if it dies, the lease expires
+  and the job returns to the queue. Failures back off exponentially up to
+  `JOBS_MAX_ATTEMPTS`.
+- **Deduplicated.** Queuing work that is already pending returns the existing job, so
+  "scan now" clicked five times is one scan.
+- **Capability-aware.** A process only claims job types it has handlers for, so a node
+  without ffmpeg leaves transcode work for a node that has it instead of failing it.
+
+> Workers sharing a queue are assumed to share a view of the storage volumes. Clustering
+> replicates *files* between nodes, not database rows — each node runs its own database
+> and its own queue.
 
 ## Share links (`/_s/<token>`)
 

@@ -31,13 +31,16 @@ const { fetchAndStore } = require('./fetchstore');
 const { HDR_CLUSTER_SECRET, HDR_CLUSTER_REPLICATED, HDR_VISIBILITY } = require('./constants');
 
 class Cluster {
-  constructor({ role, peers, secret, masterDir, cacheDir, timeoutMs }) {
+  // `onStored(hit)` is called once a pulled master has been persisted, so a
+  // peer-pulled file lands in the index exactly like an uploaded one. Best-effort.
+  constructor({ role, peers, secret, masterDir, cacheDir, timeoutMs, onStored = null }) {
     this.role = role === 'private' ? 'private' : 'public';
     this.peers = Array.isArray(peers) ? peers : [];
     this.secret = secret || '';
     this.masterDir = masterDir;
     this.cacheDir = cacheDir;
     this.timeoutMs = timeoutMs || 10000;
+    this.onStored = onStored;
     this.enabled = this.peers.length > 0;
     this.inflight = new Map(); // key -> Promise (de-dupe concurrent cold pulls)
   }
@@ -73,7 +76,11 @@ class Cluster {
         this.inflight.set(key, p);
       }
       const hit = await p;
-      if (hit) { console.log(`[media] cluster: pulled ${rel} from ${hit.base}`); return hit; }
+      if (hit) {
+        console.log(`[media] cluster: pulled ${rel} from ${hit.base}`);
+        if (this.onStored) { try { await this.onStored(hit, 'cluster'); } catch { /* indexing is best-effort */ } }
+        return hit;
+      }
     }
     return null;
   }

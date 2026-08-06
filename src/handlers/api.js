@@ -17,6 +17,11 @@
  *   GET  /_api/files           (auth)  ?q=&type=&visibility=&status=&limit=&offset=  → {files,total}
  *   GET  /_api/audit           (admin) ?limit=&offset=                    → {events}
  *   GET  /_api/stats           (admin)                                    → counts + storage
+ *   GET  /_api/jobs            (admin) ?state=&type=&limit=&offset=       → {jobs,total,summary,worker}
+ *   POST /_api/jobs            (admin) {type,payload?}                    → 202 {job}
+ *   GET  /_api/jobs/:id        (admin)                                    → {job}
+ *   POST /_api/jobs/:id/cancel (admin)                                    → {ok}
+ *   POST /_api/jobs/:id/retry  (admin)                                    → {ok,job}
  *
  * The register route allows the FIRST account unconditionally (bootstrap admin);
  * further self-registration needs config.allowRegistration, else an admin creates
@@ -27,7 +32,12 @@ const crypto = require('crypto');
 const { sendJson, readJson, clientIp } = require('../http');
 const { hasRole, hashPassword, mysqlDate } = require('../auth');
 
-function createApiHandler({ config, db, auth, trash, storage }) {
+// Job types an admin may queue from the API. Deliberately a whitelist: the queue is
+// an execution surface, and "run any registered type with any payload" is not a
+// thing an HTTP endpoint should offer.
+const QUEUEABLE_JOBS = new Set(['scan', 'extract']);
+
+function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
   // Wrap a handler so it only runs with a live DB, and turn thrown {statusCode}
   // errors into clean JSON responses.
   const guarded = (fn) => async (req, res, ctx) => {
@@ -76,6 +86,11 @@ function createApiHandler({ config, db, auth, trash, storage }) {
     ['GET', /^\/_api\/audit$/, guarded(listAudit)],
     ['GET', /^\/_api\/stats$/, guarded(stats)],
     ['GET', /^\/_api\/storage$/, guarded(storageInfo)],
+    ['GET', /^\/_api\/jobs$/, guarded(listJobs)],
+    ['POST', /^\/_api\/jobs$/, guarded(createJob)],
+    ['GET', /^\/_api\/jobs\/(\d+)$/, guarded(getJob)],
+    ['POST', /^\/_api\/jobs\/(\d+)\/cancel$/, guarded(cancelJob)],
+    ['POST', /^\/_api\/jobs\/(\d+)\/retry$/, guarded(retryJob)],
   ];
 
   async function register(req, res) {
@@ -179,9 +194,13 @@ function createApiHandler({ config, db, auth, trash, storage }) {
     const q = url.searchParams;
     const where = [];
     const args = [];
-    const status = q.get('status') || 'active';
-    where.push('status = ?'); args.push(status === 'trashed' ? 'trashed' : status === 'all' ? status : 'active');
-    if (where[where.length - 1] === 'status = ?' && args[args.length - 1] === 'all') { where.pop(); args.pop(); }
+    // `missing` joined active/trashed once the scanner could report bytes that
+    // vanished from every volume; `all` drops the filter entirely.
+    const status = (q.get('status') || 'active').toLowerCase();
+    if (status !== 'all') {
+      where.push('status = ?');
+      args.push(['trashed', 'missing', 'active'].includes(status) ? status : 'active');
+    }
     if (q.get('q')) { where.push('(path LIKE ? OR name LIKE ?)'); const like = `%${q.get('q')}%`; args.push(like, like); }
     if (q.get('type')) { where.push('mime LIKE ?'); args.push(`${q.get('type')}%`); }
     if (q.get('visibility')) { where.push('visibility = ?'); args.push(q.get('visibility') === 'private' ? 'private' : 'public'); }
@@ -193,9 +212,12 @@ function createApiHandler({ config, db, auth, trash, storage }) {
     const limit = clampInt(q.get('limit'), 50, 1, 500);
     const offset = clampInt(q.get('offset'), 0, 0, 1e9);
     const totalRow = await db.one(`SELECT COUNT(*) AS n FROM files ${clause}`, args);
+    // `id DESC` is not decoration: DATETIME has second granularity, so a bulk upload
+    // gives dozens of rows the same `updated_at` and MySQL is free to order them
+    // differently per query — which makes offset pages silently repeat and skip rows.
     const rows = await db.query(
-      `SELECT id, path, name, ext, mime, size_bytes, width, height, visibility, status, created_at, updated_at
-       FROM files ${clause} ORDER BY updated_at DESC LIMIT ${limit} OFFSET ${offset}`, args);
+      `SELECT id, path, name, ext, mime, size_bytes, volume_id, width, height, visibility, status, created_at, updated_at
+       FROM files ${clause} ORDER BY updated_at DESC, id DESC LIMIT ${limit} OFFSET ${offset}`, args);
     return sendJson(res, 200, { files: rows, total: totalRow ? Number(totalRow.n) : rows.length, limit, offset });
   }
 
@@ -368,13 +390,78 @@ function createApiHandler({ config, db, auth, trash, storage }) {
     return sendJson(res, 200, { placement: config.storagePlacement, multi: !!(storage && storage.multi), volumes });
   }
 
+  // ── Background jobs ────────────────────────────────────────────────────────
+  function requireJobs() {
+    if (!jobs || !jobs.enabled) throw httpErr(503, 'jobs_disabled', 'The job queue is not available');
+    return jobs;
+  }
+
+  async function listJobs(req, res, { url }) {
+    await requireAdmin(req);
+    const q = url.searchParams;
+    const r = await requireJobs().list({
+      state: q.get('state') || null,
+      type: q.get('type') || null,
+      limit: clampInt(q.get('limit'), 50, 1, 500),
+      offset: clampInt(q.get('offset'), 0, 0, 1e9),
+    });
+    return sendJson(res, 200, {
+      ...r,
+      summary: await jobs.summary(),
+      worker: { running: jobs.workerRunning, id: jobs.workerId, concurrency: jobs.concurrency, types: jobs.types() },
+    });
+  }
+
+  async function createJob(req, res) {
+    const ctx = await requireAdmin(req);
+    const body = await readJson(req);
+    requireFields(body, ['type']);
+    const type = String(body.type);
+    if (!QUEUEABLE_JOBS.has(type)) throw httpErr(400, 'bad_type', `Not queueable via the API: ${type}`);
+    const payload = body.payload && typeof body.payload === 'object' ? body.payload : {};
+    // One live scan at a time; extraction dedupes per path.
+    const dedupeKey = type === 'scan'
+      ? `scan:${payload.volumeId || 'all'}`
+      : (payload.path ? `extract:${require('../util').pathKey(String(payload.path).replace(/^\/+/, ''))}` : null);
+    const id = await requireJobs().enqueue(type, payload, { dedupeKey, priority: 4, createdBy: ctx.user.id });
+    if (!id) throw httpErr(500, 'enqueue_failed', 'Could not queue the job');
+    await audit(req, 'job_create', payload.path || null, ctx.user.id);
+    return sendJson(res, 202, { job: await jobs.get(id) });
+  }
+
+  async function getJob(req, res, { params }) {
+    await requireAdmin(req);
+    const job = await requireJobs().get(Number(params[0]));
+    if (!job) throw httpErr(404, 'not_found', 'Job not found');
+    return sendJson(res, 200, { job });
+  }
+
+  async function cancelJob(req, res, { params }) {
+    const ctx = await requireAdmin(req);
+    const ok = await requireJobs().cancel(Number(params[0]));
+    if (!ok) throw httpErr(409, 'not_cancellable', 'Job is not queued or running');
+    await audit(req, 'job_cancel', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  async function retryJob(req, res, { params }) {
+    const ctx = await requireAdmin(req);
+    const ok = await requireJobs().retry(Number(params[0]));
+    if (!ok) throw httpErr(409, 'not_retryable', 'Job has not finished');
+    await audit(req, 'job_retry', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, job: await jobs.get(Number(params[0])) });
+  }
+
   async function stats(req, res) {
     await requireAdmin(req);
     const files = await db.one(`SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes),0) AS bytes FROM files WHERE status='active'`);
     const trashed = await db.one(`SELECT COUNT(*) AS n FROM files WHERE status='trashed'`);
+    const missing = await db.one(`SELECT COUNT(*) AS n FROM files WHERE status='missing'`);
     const users = await db.one(`SELECT COUNT(*) AS n FROM users`);
     return sendJson(res, 200, {
-      files: Number(files.n), storageBytes: Number(files.bytes), trashed: Number(trashed.n), users: Number(users.n),
+      files: Number(files.n), storageBytes: Number(files.bytes), trashed: Number(trashed.n),
+      missing: Number(missing.n), users: Number(users.n),
+      jobs: jobs && jobs.enabled ? await jobs.summary() : null,
     });
   }
 

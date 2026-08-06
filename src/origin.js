@@ -15,12 +15,17 @@
 const { fetchAndStore } = require('./fetchstore');
 
 class OriginFetcher {
-  constructor({ sources, masterDir, cacheDir, timeoutMs }) {
+  // `onStored(hit)` is called once a master has been persisted. It is how a pulled
+  // master reaches the index: `fetchstore` publishes the bytes, and without this hook
+  // the file was served correctly but stayed invisible to search, the console and
+  // every feature built on the index. Best-effort — a failure never affects the serve.
+  constructor({ sources, masterDir, cacheDir, timeoutMs, onStored = null }) {
     this.sources = Array.isArray(sources) ? sources : [];
     this.enabled = this.sources.length > 0;
     this.masterDir = masterDir;
     this.cacheDir = cacheDir;
     this.timeoutMs = timeoutMs || 10000;
+    this.onStored = onStored;
     this.inflight = new Map(); // rel -> Promise (de-dupe concurrent cold misses)
   }
 
@@ -46,7 +51,10 @@ class OriginFetcher {
       bases: this.sources, rel, masterDir: this.masterDir, cacheDir: this.cacheDir,
       timeoutMs: this.timeoutMs, label: 'origin',
     });
-    if (hit) console.log(`[media] origin: fetched ${rel} from ${hit.base} (${(hit.stat.size / 1024).toFixed(1)} KiB)`);
+    if (hit) {
+      console.log(`[media] origin: fetched ${rel} from ${hit.base} (${(hit.stat.size / 1024).toFixed(1)} KiB)`);
+      if (this.onStored) { try { await this.onStored(hit, 'origin'); } catch { /* indexing is best-effort */ } }
+    }
     return hit;
   }
 }

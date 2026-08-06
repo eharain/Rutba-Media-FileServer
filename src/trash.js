@@ -74,13 +74,18 @@ function createTrash({ config, db, cluster, storage = null }) {
       if (!st || !st.isFile()) throwErr(410, 'no_retained_copy', 'No retained copy exists to restore');
 
       // Place the restored master back on a volume (multi-volume aware).
-      let dest;
-      if (storage) { const place = await storage.placeWrite(rel); if (!place) throwErr(507, 'no_storage', 'No writable storage volume'); dest = place.abs; }
+      let dest, volumeId = null;
+      if (storage) { const place = await storage.placeWrite(rel); if (!place) throwErr(507, 'no_storage', 'No writable storage volume'); dest = place.abs; volumeId = place.volumeId; }
       else dest = resolveSafe(config.masterDir, rel);
       if (!dest) throwErr(400, 'bad_path', 'Invalid path');
       await fsp.mkdir(path.dirname(dest), { recursive: true });
       await moveFile(trashAbs, dest);
-      await db.query(`UPDATE files SET status='active', trashed_at=NULL WHERE id=?`, [row.id]);
+      // Restoring may place the bytes on a different volume than they left from, so
+      // re-record the placement along with the status.
+      const restored = await fsp.stat(dest).catch(() => null);
+      await db.query(
+        `UPDATE files SET status='active', trashed_at=NULL, volume_id=COALESCE(?, volume_id), mtime_ms=COALESCE(?, mtime_ms) WHERE id=?`,
+        [volumeId, restored ? Math.round(restored.mtimeMs) : null, row.id]);
 
       // Re-establish an explicit private sidecar if needed, then re-replicate the
       // master to eligible peers (the earlier delete removed it from them).

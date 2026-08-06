@@ -120,6 +120,20 @@ function loadConfig(env = process.env) {
     // WebDAV mount at /_dav/ (needs the DB layer for accounts). On by default when
     // the DB layer is up; set WEBDAV_ENABLED/WEBDAV to 0/false/off to disable.
     webdavEnabled: !/^(0|false|off|no)$/i.test(env.WEBDAV_ENABLED || env.WEBDAV || ''),
+    // ── Background jobs (needs the DB layer) ───────────────────────────────────
+    // The worker that runs scans, metadata extraction, transcodes, enrichment and
+    // scrubs. On by default once the DB layer is up. JOBS_ENABLED=0 keeps the queue
+    // (jobs can still be enqueued and inspected) but runs nothing in THIS process —
+    // for deployments where a separate worker owns execution.
+    jobsEnabled: !/^(0|false|off|no)$/i.test(env.JOBS_ENABLED || ''),
+    jobsConcurrency: parseInt(env.JOBS_CONCURRENCY, 10) || 2,
+    jobsPollMs: parseInt(env.JOBS_POLL_MS, 10) || 1000,
+    jobsMaxAttempts: parseInt(env.JOBS_MAX_ATTEMPTS, 10) || 5,
+    // Reconcile the filesystem into the index once at boot. Off by default (a scan
+    // of a large library is real work); recommended after mounting existing masters.
+    scanOnBoot: /^(1|true|yes|on)$/i.test(env.SCAN_ON_BOOT || ''),
+    // Ceiling on scan throughput so a reconcile never starves request-path I/O.
+    scanRateFilesPerSec: parseInt(env.SCAN_RATE_FILES_PER_SEC, 10) || 200,
   };
 }
 
