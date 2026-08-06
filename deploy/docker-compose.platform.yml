@@ -1,0 +1,60 @@
+# Full-platform overlay — adds the database-backed layer on top of the plain origin.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --build
+#
+# What this turns on (all of it is off in docker-compose.yml alone):
+#   accounts + RBAC + sessions/API tokens · file index & search · audit trail
+#   /_api control plane · /_ui web console · /_s share links · trash & recovery
+#   /_dav WebDAV mount · background job queue + filesystem scanner
+#
+# Compose reads `deploy/.env`. Seed it from the repo-root reference file and set at
+# minimum MEDIA_UPLOAD_TOKEN and MYSQL_PASSWORD before bringing this up:
+#   cp ../.env.example .env
+
+services:
+  db:
+    image: mysql:8.0
+    container_name: media-db
+    restart: unless-stopped
+    command: >
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_PASSWORD:?set MYSQL_PASSWORD}"
+      MYSQL_DATABASE: "${DB_NAME:-media}"
+    volumes:
+      - media_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - edge
+
+  image-server:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_USER: "${DB_USER:-root}"
+      DB_PASSWORD: "${MYSQL_PASSWORD:?set MYSQL_PASSWORD}"
+      DB_NAME: "${DB_NAME:-media}"
+      # The layer waits this long for MySQL on boot before degrading to origin-only.
+      DB_CONNECT_RETRIES: "${DB_CONNECT_RETRIES:-30}"
+      ALLOW_REGISTRATION: "${ALLOW_REGISTRATION:-0}"
+      SESSION_TTL_DAYS: "${SESSION_TTL_DAYS:-30}"
+      READ_AUTH_MODE: "${READ_AUTH_MODE:-public}"
+      WEBDAV_ENABLED: "${WEBDAV_ENABLED:-1}"
+      # Behind TLS-terminating Caddy, require secure transport for cookies/WebDAV.
+      SECURE_COOKIES: "${SECURE_COOKIES:-auto}"
+      # Background worker: index maintenance, media extraction, transcodes, scrubs.
+      JOBS_ENABLED: "${JOBS_ENABLED:-1}"
+      JOBS_CONCURRENCY: "${JOBS_CONCURRENCY:-2}"
+      SCAN_ON_BOOT: "${SCAN_ON_BOOT:-0}"
+
+volumes:
+  media_db:

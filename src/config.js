@@ -176,6 +176,7 @@ function buildDbConfig(env) {
         password: decodeURIComponent(u.password || ''),
         database: u.pathname.replace(/^\//, '') || 'media',
         connectionLimit: parseInt(env.DB_POOL, 10) || 10,
+        connectRetries: parseInt(env.DB_CONNECT_RETRIES, 10) || 0,
       };
     } catch { /* fall through to discrete vars */ }
   }
@@ -188,6 +189,7 @@ function buildDbConfig(env) {
     password: env.DB_PASSWORD || env.MYSQL_PASSWORD || env.DB_PASS || '',
     database: env.DB_NAME || env.MYSQL_DATABASE || 'media',
     connectionLimit: parseInt(env.DB_POOL, 10) || 10,
+    connectRetries: parseInt(env.DB_CONNECT_RETRIES, 10) || 0,
   };
 }
 

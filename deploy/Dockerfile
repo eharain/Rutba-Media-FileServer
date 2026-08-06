@@ -10,12 +10,16 @@ RUN npm ci --omit=dev --no-audit --no-fund
 
 COPY server.js ./
 COPY src ./src
+# The web console (/_ui/) is served from <repo>/web at runtime — without this the
+# console 404s in every container deploy.
+COPY web ./web
 
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=3000 \
     MASTER_DIR=/data/masters \
-    CACHE_DIR=/data/cache
+    CACHE_DIR=/data/cache \
+    TRASH_DIR=/data/trash
 
 EXPOSE 3000
 

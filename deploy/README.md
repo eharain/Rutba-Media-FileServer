@@ -5,11 +5,43 @@ Two targets — pick per site.
 ## A) VPS (Docker behind the shared Caddy) — recommended for rutba.pk
 Masters live in a Docker volume; the migration populates them. No external access needed.
 
+Two modes, one command each. **Origin-only** is the plain masters-only resize origin —
+no database, no console, no accounts:
+
 ```bash
 docker network create edge 2>/dev/null || true            # shared with the ERP Caddy
 cd deploy
 MEDIA_UPLOAD_TOKEN='<strong-secret>' docker compose up -d --build
 ```
+
+**Full platform** adds MySQL and everything gated behind it — accounts + RBAC, the
+`/_ui/` console, file index & search, audit trail, share links, trash & recovery, the
+`/_dav/` WebDAV mount and the background job queue:
+
+```bash
+cd deploy
+cp ../.env.example .env        # set MEDIA_UPLOAD_TOKEN and MYSQL_PASSWORD at minimum
+docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --build
+```
+The database and its schema are created on first boot; the **first account you register
+becomes the admin**:
+```bash
+curl -sX POST https://images.rutba.pk/_api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@example.com","username":"you","password":"<strong>"}'
+```
+Then open **`https://images.rutba.pk/_ui/`** and log in. Mount the store as a network
+drive from `https://images.rutba.pk/_dav/` using the same credentials.
+
+**Persistence.** Three named volumes must outlive the container: `media_masters`
+(the masters), `media_db` (accounts, index, audit) and `media_trash` (recoverable
+deletes — `TRASH_DIR=/data/trash` is set explicitly for exactly this reason). Only
+`media_cache` is safe to discard.
+
+**Pre-existing masters.** Files copied or mounted in directly are served correctly but
+are invisible to the index until they are scanned. After bringing up full-platform
+mode over an existing master directory, run a scan (console → Storage → *Scan
+volumes*, or `POST /_api/jobs` with `{"type":"scan"}`), or set `SCAN_ON_BOOT=1`.
 Add `Caddyfile.snippet` to the edge Caddy and reload:
 ```
 images.rutba.pk { reverse_proxy image-server:3000 }

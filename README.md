@@ -3,7 +3,8 @@
 A Node.js media origin for `images.rutba.pk` (reusable for `images.trustlist.uk`),
 built for **Hostinger Node.js hosting** (Business Web Hosting, `77.37.37.27`) or a VPS container.
 
-> **Project layout** — full spec in `SPEC.md`.
+> **Project layout** — full spec in `SPEC.md`; what's outstanding and in what order
+> in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 > - `server.js` / `package.json` — the media service (this README)
 > - `provider/` — Strapi upload provider (`strapi-provider-upload-media`)
 > - `migrate/` — DB-driven migration (masters-only + `formats` rewrite)
@@ -150,18 +151,34 @@ src/             # the media service, split for reuse/testing:
   origin.js      #   OriginFetcher — download a missing master from a source list
   cluster.js     #   Cluster — replicate masters to peers + pull on miss (role/visibility)
   visibility.js  #   public/private rules: PRIVATE_PATHS + X-Visibility sidecar
-  handlers/      #   read.js (GET/HEAD), write.js (PUT/DELETE, auth + replication)
+  storage.js     #   multi-volume masters: placement policy + union reads (optional)
+  masterops.js   #   protocol-agnostic master mutations (shared by HTTP + WebDAV)
+  ── platform layer (all inert without a database) ──
+  db.js          #   optional MySQL pool; degrades to an inert stub when unconfigured
+  schema.js      #   idempotent CREATE TABLE statements applied by db.init()
+  auth.js        #   scrypt passwords, hashed session/API tokens, RBAC predicates
+  fileindex.js   #   best-effort `files` upserts + audit trail on every master write
+  trash.js       #   Trash & Recovery — move-to-trash, restore, purge, empty
+  metadata.js    #   normalize sharp/EXIF + ffprobe output into file_metadata columns
+  ffmpeg.js      #   optional ffmpeg/ffprobe loader (bundled static binaries or PATH)
+  mediavariant.js#   video poster frames + on-demand transcodes, cached like variants
+  handlers/      #   read.js (GET/HEAD), write.js (PUT/DELETE, auth + replication),
+                 #   api.js (/_api), ui.js (/_ui), share.js (/_s), webdav.js (/_dav)
   app.js         #   createApp(config) → { server, cache } (routing + wiring)
-package.json     # dep: sharp; `npm start` → node server.js
+package.json     # deps: sharp, mysql2, exif-reader, ffmpeg-static, ffprobe-static
+web/             # web console SPA (index.html + app.js + styles.css, no build step)
+docs/            # PLATFORM.md (platform layer reference), ROADMAP.md
 public/          # MASTER_DIR by default — put ORIGINAL files here (gitignored)
 provider/        # Strapi upload provider (strapi-provider-upload-media)
 migrate/         # DB-driven migration (mysql2/pg)
-deploy/          # Dockerfile, compose, Caddy snippet, deploy guide
-test/            # automated suite (26 checks)
+deploy/          # Dockerfile, compose (+ platform overlay), Caddy snippet, guide
+test/            # automated suite
 nextjs/          # optional <Image> loader
+.env.example     # every environment variable, grouped by feature
 ```
-> `server.js` + `src/` are both required at deploy time (e.g. the Dockerfile copies
-> both, and Hostinger needs the whole `src/` folder alongside the startup file).
+> `server.js` **and** `src/` are both required at deploy time, and `web/` too if you
+> want the console (the Dockerfile copies all three; Hostinger needs them alongside
+> the startup file).
 > The app is also exported (`require('./server.js')` → `{ createApp, loadConfig }`)
 > so it can be embedded or driven from tests without spawning a process.
 
@@ -177,7 +194,10 @@ npm test               # runs the 26-check suite (installs test deps first)
 ## Deploy on Hostinger (hPanel → Node.js app)
 1. **hPanel → `images.rutba.pk` → Node.js** (Setup Node.js App).
 2. **Node 18+**, **startup file `server.js`**, **app root** = your upload folder, URL `images.rutba.pk`.
-3. Upload `server.js` + `package.json`; click **Run NPM Install** (installs `sharp`).
+3. Upload `server.js`, `package.json`, the whole **`src/`** folder and — if you want the
+   web console — **`web/`**; click **Run NPM Install** (installs `sharp`).
+   All four are required at runtime: `src/` is the service itself, and `/_ui/` is served
+   from `web/`.
 4. Put **original** files in `public/` (or set `MASTER_DIR`). Create nothing for the cache — it's auto-made.
 5. **Start/Restart**. Hostinger sets `PORT` and proxies the domain.
 
@@ -189,9 +209,15 @@ curl -r 0-1023 -sD - -o /dev/null https://images.rutba.pk/<name>.mp4  # 206
 ```
 
 ## Env config
+> **[`.env.example`](.env.example) is the complete reference** — every variable,
+> grouped by feature, with each optional block marked as gated. The table below
+> covers the origin itself; the platform-layer vars are documented in
+> [docs/PLATFORM.md](docs/PLATFORM.md) and repeated in `.env.example`.
+
 | Var | Default | Purpose |
 |---|---|---|
 | `PORT` | (Hostinger) | listen port |
+| `HOST` | `0.0.0.0` | listen address |
 | `UPLOAD_DIR` | `./public` | originals/masters dir — where the actual files live. Aliases: `MASTER_DIR`, `MEDIA_DIR` (first one set wins). A leading `~` expands, e.g. `UPLOAD_DIR=~/uploads/trustlist/` |
 | `CACHE_DIR` | `./.cache` | variant cache dir |
 | `CACHE_MAX_BYTES` | `1073741824` (1 GiB) | cache cap before LRU eviction |
@@ -207,6 +233,17 @@ curl -r 0-1023 -sD - -o /dev/null https://images.rutba.pk/<name>.mp4  # 206
 | `CLUSTER_TIMEOUT_MS` | `ORIGIN_TIMEOUT_MS` or `10000` | per-request timeout for peer pulls/replication |
 | `PRIVATE_PATHS` | (none) | space/comma-separated path prefixes whose masters are private (segment-aware). An `X-Visibility` header on upload overrides per file |
 | `CORS_ORIGIN` | `*` | restrict if desired |
+| `STORAGE_VOLUMES` | (none) | extra master volumes, `id:path` or `id:path\|ro`. Empty → single-volume |
+| `STORAGE_PLACEMENT` | `free` | new-file placement: `free` \| `fill` \| `route` |
+| `STORAGE_ROUTES` | (none) | prefix→volume rules for `route` placement, e.g. `archive/=archive` |
+| `FFMPEG_PATH` / `FFPROBE_PATH` | (bundled) | explicit binaries; else `ffmpeg-static`/`ffprobe-static`, else `PATH`. None → video processing off |
+| `DB_HOST` … `DB_NAME` | (none) | **master switch for the platform layer.** `MYSQL_*` aliases work; `DB_URL` accepted. Unset → no accounts/`_api`/`_ui`/`_s`/`_dav`/trash |
+| `DB_CONNECT_RETRIES` | `0` | boot-time connect retries (1s apart) before degrading to origin-only |
+| `TRASH_DIR` | sibling of `MASTER_DIR` | recoverable deletes. **Set explicitly in containers** so it maps to a persistent volume |
+| `ALLOW_REGISTRATION` | `0` | open self-service registration (the first account is always allowed) |
+| `SESSION_TTL_DAYS` | `30` | session lifetime |
+| `READ_AUTH_MODE` | `public` | `public` \| `mixed` \| `private` — see docs/PLATFORM.md |
+| `WEBDAV_ENABLED` | `1` (with DB) | the `/_dav/` mount |
 
 ## Migration / integration (next steps)
 - Copy **only masters** from the VPS Strapi uploads to `MASTER_DIR` — i.e. exclude

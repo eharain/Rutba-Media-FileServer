@@ -1,12 +1,19 @@
 # Run the media service on the VPS, joined to the shared `edge` Caddy network.
 #
-#   docker network create edge            # if not already present
-#   MEDIA_UPLOAD_TOKEN=... docker compose up -d --build
+# Two modes, one command each (see deploy/README.md):
+#
+#   ORIGIN-ONLY — masters-only resize origin, no database, no console:
+#     MEDIA_UPLOAD_TOKEN=... docker compose up -d --build
+#
+#   FULL PLATFORM — adds MySQL, accounts/RBAC, /_ui console, trash, shares, WebDAV:
+#     cp .env.example .env && edit it
+#     docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --build
 #
 # Then add the Caddyfile.snippet block to the edge Caddy and reload.
 #
 # Masters live in the `media_masters` volume; populate it with the migration
-# script (PUT) or by mounting/copying existing Strapi masters. Cache is ephemeral.
+# script (PUT) or by mounting/copying existing Strapi masters. Cache is ephemeral;
+# `media_trash` holds recoverable deletes and MUST outlive the container.
 
 services:
   image-server:
@@ -20,6 +27,9 @@ services:
       PORT: "3000"
       MASTER_DIR: /data/masters
       CACHE_DIR: /data/cache
+      # Recoverable deletes land here. Explicit (not the derived /data/.media-trash)
+      # so it maps to a named volume and survives `docker compose up --build`.
+      TRASH_DIR: /data/trash
       CACHE_MAX_BYTES: "${CACHE_MAX_BYTES:-2147483648}"   # 2 GiB cache cap
       IMAGE_QUALITY: "${IMAGE_QUALITY:-80}"
       CORS_ORIGIN: "${CORS_ORIGIN:-*}"
@@ -27,9 +37,12 @@ services:
     volumes:
       - media_masters:/data/masters
       - media_cache:/data/cache
+      - media_trash:/data/trash
       # To serve EXISTING ERP masters without migrating files, you may instead mount
       # the Strapi uploads volume read-only as the master dir (then only the DB needs
-      # rewriting):
+      # rewriting). NOTE: pre-existing files are invisible to the platform index until
+      # a scan indexes them — run `POST /_api/jobs/scan` (or SCAN_ON_BOOT=1) after
+      # bringing the stack up in full-platform mode:
       #   - rutba-erp_strapi_uploads:/data/masters:ro
     networks:
       - edge
@@ -41,3 +54,4 @@ networks:
 volumes:
   media_masters:
   media_cache:
+  media_trash:

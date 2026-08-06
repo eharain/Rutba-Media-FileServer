@@ -54,9 +54,9 @@ function createDb(config) {
     async init() {
       try {
         // Connect without selecting a database first so we can create it if absent.
-        const boot = await mysql.createConnection({
-          host: cfg.host, port: cfg.port, user: cfg.user, password: cfg.password, multipleStatements: false,
-        });
+        // DB_CONNECT_RETRIES lets the server wait out a database that is still
+        // booting alongside it (docker compose); 0 (default) fails fast as before.
+        const boot = await connectWithRetry(cfg);
         await boot.query(
           `CREATE DATABASE IF NOT EXISTS \`${cfg.database.replace(/`/g, '')}\` ` +
           `CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
@@ -81,6 +81,24 @@ function createDb(config) {
     },
   };
   return db;
+}
+
+// Open the bootstrap connection, retrying up to `cfg.connectRetries` times (1s
+// apart) so a co-scheduled database container has time to accept connections.
+// With the default 0 retries this is a single attempt — identical to before.
+async function connectWithRetry(cfg) {
+  const attempts = Math.max(0, cfg.connectRetries || 0) + 1;
+  for (let i = 1; ; i++) {
+    try {
+      return await mysql.createConnection({
+        host: cfg.host, port: cfg.port, user: cfg.user, password: cfg.password, multipleStatements: false,
+      });
+    } catch (err) {
+      if (i >= attempts) throw err;
+      if (i === 1) console.log(`[media] db not ready (${err.code || err.message}) — retrying up to ${attempts - 1}×`);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
 }
 
 // A fully inert DB used when the feature is off, so callers need no null checks.
