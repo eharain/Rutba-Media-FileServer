@@ -30,6 +30,7 @@ const { createScanner } = require('./scanner');
 const { registerJobTypes } = require('./jobtypes');
 const { createTrash } = require('./trash');
 const { createMasterResolver } = require('./resolve');
+const { createReadGuard } = require('./readauth');
 const { createReadHandler } = require('./handlers/read');
 const { createWriteHandler } = require('./handlers/write');
 const { createApiHandler } = require('./handlers/api');
@@ -69,10 +70,13 @@ function createApp(config) {
   const cluster = new Cluster({ role: config.clusterRole, peers: config.clusterPeers, secret: config.clusterSecret, masterDir: config.masterDir, cacheDir: config.cacheDir, timeoutMs: config.clusterTimeoutMs, onStored: indexPulled });
 
   const scanner = createScanner({ config, storage, db, index, jobs });
-  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config });
+  registerJobTypes({ jobs, scanner, storage, index, sharp, ffmpeg, config, db });
   const trash = createTrash({ config, db, cluster, storage });
   const resolveMaster = createMasterResolver({ config, storage, origin, cluster });
-  const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster, media });
+  // READ_AUTH_MODE enforcement. `public` (the default) yields an open guard that
+  // short-circuits, so the read path is unchanged unless the mode is actually set.
+  const readGuard = createReadGuard({ config, auth });
+  const handleRead = createReadHandler({ config, resizer, sharp, resolveMaster, media, readGuard });
   const handleWrite = createWriteHandler({ config, cache, cluster, storage, index, trash, auth, db, ffmpeg });
   const handleApi = createApiHandler({ config, db, auth, trash, storage, jobs });
   const handleUi = createUiHandler({ db });

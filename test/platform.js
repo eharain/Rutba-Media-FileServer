@@ -28,6 +28,9 @@ const assert = require('assert');
 const { execFile } = require('child_process');
 const sharp = require('sharp');
 const { Runner, spawnServer, sleep, waitFor } = require('./harness');
+// Same TOTP implementation the server uses — the point of the MFA checks is that a
+// standard authenticator's code is accepted, and this is that code generator.
+const totp = require('../src/totp');
 
 // ── database config (env-driven; no credentials committed) ────────────────────
 const DB = {
@@ -46,6 +49,8 @@ if (!DB.host) {
 const DB_NAME = `media_test_${process.pid}_${crypto.randomBytes(3).toString('hex')}`;
 // The pull-through node's own index (see withPullNode) — nodes don't share a database.
 const DB_NAME_PULL = `${DB_NAME}_pull`;
+// Every other throwaway database this run creates, so the cleanup drops all of them.
+const extraDatabases = new Set([DB_NAME_PULL]);
 
 const PORT = 8741;
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -170,6 +175,46 @@ async function withPullNode({ img, img2 }, fn) {
   }
 }
 
+/**
+ * Boot a throwaway node with its own database and master dir, run `fn`, tear it all
+ * down. Used for settings that are decided at boot and cannot be toggled per request
+ * — READ_AUTH_MODE and SECURE_COOKIES.
+ */
+async function withNode({ label, port, dbName, env = {}, seed = null }, fn) {
+  const dir = path.join(tmp, label + '-masters');
+  fs.mkdirSync(dir, { recursive: true });
+  if (seed) for (const [rel, buf] of Object.entries(seed)) {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, buf);
+  }
+  extraDatabases.add(dbName);
+  let node = null;
+  try {
+    node = await spawnServer({
+      port, label,
+      env: {
+        MASTER_DIR: dir, CACHE_DIR: path.join(tmp, label + '-cache'), TRASH_DIR: path.join(tmp, label + '-trash'),
+        UPLOAD_TOKEN: TOKEN,
+        DB_HOST: DB.host, DB_PORT: String(DB.port), DB_USER: DB.user, DB_PASSWORD: DB.password, DB_NAME: dbName,
+        ...env,
+      },
+    });
+    await fn(node, dir);
+  } finally {
+    if (node) node.stop();
+  }
+}
+
+// Register an admin on a fresh node and return its bearer token.
+async function bootstrapAdmin(base) {
+  const res = await fetch(base + '/_api/auth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'root@test.local', username: 'root', password: 'rootpw-12345' }),
+  });
+  return (await res.json()).token;
+}
+
 // ── suite ─────────────────────────────────────────────────────────────────────
 (async () => {
   let srv = null;
@@ -187,6 +232,12 @@ async function withPullNode({ img, img2 }, fn) {
         // Registration stays closed so the "second registration is refused" check is
         // meaningful; the first (bootstrap admin) account is always allowed.
         ALLOW_REGISTRATION: '0',
+        MFA_ENABLED: '1',
+        // A low per-account threshold keeps the throttling check quick. The per-IP
+        // threshold stays high so the rest of the suite's deliberate bad logins —
+        // all from 127.0.0.1 — never lock the whole suite out.
+        LOGIN_MAX_FAILURES: '4',
+        LOGIN_MAX_FAILURES_IP: '200',
       },
     });
 
@@ -204,6 +255,7 @@ async function withPullNode({ img, img2 }, fn) {
 
     // ── accounts & sessions ───────────────────────────────────────────────────
     let adminTok = null, editorTok = null, viewerTok = null, editorId = null, viewerId = null;
+    let apiToken = null, disabledUserId = null, mfaTok = null, mfaSecret = null, mfaRecovery = [];
 
     await t('register: first account bootstraps as admin', async () => {
       const r = await api('/_api/auth/register', { method: 'POST', json: { email: 'admin@test.local', username: 'admin', password: 'adminpw-123' } });
@@ -1000,6 +1052,344 @@ async function withPullNode({ img, img2 }, fn) {
       });
     });
 
+    // ── API tokens ────────────────────────────────────────────────────────────
+    await t('tokens: minting shows the plaintext exactly once', async () => {
+      const r = await api('/_api/tokens', { method: 'POST', token: editorTok, json: { name: 'ci-pipeline' } });
+      assert.equal(r.status, 201);
+      assert.match(r.body.token, /^[a-f0-9]{64}$/);
+      apiToken = r.body.token;
+      const list = await api('/_api/tokens', { token: editorTok });
+      const row = list.body.tokens.find((x) => x.name === 'ci-pipeline');
+      assert.ok(row, 'the token is listed');
+      assert.equal(row.token, undefined, 'but never its plaintext');
+      assert.equal(row.token_hash, undefined, 'nor its hash');
+    });
+
+    await t('tokens: an API token authenticates the API and uploads, as its owner', async () => {
+      const me = await api('/_api/auth/me', { token: apiToken });
+      assert.equal(me.status, 200);
+      assert.equal(me.body.user.id, editorId, 'acts as the user who minted it');
+      assert.equal((await put('via-token.jpg', img2, { token: apiToken })).status, 201);
+      assert.equal((await fileRow('via-token.jpg')).owner_user_id, editorId);
+    });
+
+    await t('tokens: an API token works as a WebDAV password (the MFA-safe path)', async () => {
+      const r = await dav('gallery/', { method: 'PROPFIND', headers: { ...basicH('ed', apiToken), Depth: '1' } });
+      assert.equal(r.status, 207);
+    });
+
+    await t('tokens: revoking one stops it immediately', async () => {
+      const list = await api('/_api/tokens', { token: editorTok });
+      const row = list.body.tokens.find((x) => x.name === 'ci-pipeline');
+      assert.equal((await api(`/_api/tokens/${row.id}`, { method: 'DELETE', token: editorTok })).status, 200);
+      assert.equal((await api('/_api/auth/me', { token: apiToken })).status, 401);
+      assert.equal((await api(`/_api/tokens/${row.id}`, { method: 'DELETE', token: editorTok })).status, 404);
+    });
+
+    await t('tokens: an expired token is refused', async () => {
+      const r = await api('/_api/tokens', { method: 'POST', token: editorTok, json: { name: 'short-lived' } });
+      const conn = await inspectConn();
+      await conn.query('UPDATE api_tokens SET expires_at = DATE_SUB(NOW(), INTERVAL 1 DAY) WHERE name = ?', ['short-lived']);
+      assert.equal((await api('/_api/auth/me', { token: r.body.token })).status, 401);
+    });
+
+    // ── passwords ─────────────────────────────────────────────────────────────
+    await t('password: self-service change requires the current password', async () => {
+      const r = await api('/_api/auth/password', { method: 'POST', token: viewerTok, json: { old_password: 'wrong', new_password: 'brand-new-pw-1' } });
+      assert.equal(r.status, 403);
+      assert.equal(r.body.error, 'bad_password');
+    });
+
+    await t('password: a too-short new password is refused', async () => {
+      const r = await api('/_api/auth/password', { method: 'POST', token: viewerTok, json: { old_password: 'viewerpw-123', new_password: 'short' } });
+      assert.equal(r.status, 400);
+      assert.equal(r.body.error, 'weak_password');
+    });
+
+    await t('password: a successful change revokes other sessions but keeps this one', async () => {
+      // A second session for the same user, which must not survive the change.
+      const other = (await api('/_api/auth/login', { method: 'POST', json: { login: 'vi', password: 'viewerpw-123' } })).body.token;
+      assert.equal((await api('/_api/auth/me', { token: other })).status, 200);
+      const r = await api('/_api/auth/password', { method: 'POST', token: viewerTok, json: { old_password: 'viewerpw-123', new_password: 'viewer-new-pw-9' } });
+      assert.equal(r.status, 200);
+      assert.equal((await api('/_api/auth/me', { token: other })).status, 401, 'the other session is gone');
+      assert.equal((await api('/_api/auth/me', { token: viewerTok })).status, 200, 'the acting session survives');
+      assert.equal((await api('/_api/auth/login', { method: 'POST', json: { login: 'vi', password: 'viewer-new-pw-9' } })).status, 200);
+      assert.equal((await api('/_api/auth/login', { method: 'POST', json: { login: 'vi', password: 'viewerpw-123' } })).status, 401);
+    });
+
+    await t('password: an admin reset works without the old password and kills every session', async () => {
+      const live = (await api('/_api/auth/login', { method: 'POST', json: { login: 'vi', password: 'viewer-new-pw-9' } })).body.token;
+      const r = await api(`/_api/users/${viewerId}/password`, { method: 'POST', token: adminTok, json: { new_password: 'reset-by-admin-1' } });
+      assert.equal(r.status, 200);
+      assert.equal((await api('/_api/auth/me', { token: live })).status, 401);
+      const relogin = await api('/_api/auth/login', { method: 'POST', json: { login: 'vi', password: 'reset-by-admin-1' } });
+      assert.equal(relogin.status, 200);
+      viewerTok = relogin.body.token;
+      assert.equal((await api('/_api/users/1/password', { method: 'POST', token: viewerTok, json: { new_password: 'nope-nope-1' } })).status, 403);
+    });
+
+    // ── account lifecycle ─────────────────────────────────────────────────────
+    await t('roles: revoking a role takes effect immediately', async () => {
+      // `vi` was promoted to editor earlier and can write; taking it back must stop that.
+      assert.equal((await put('still-editor.jpg', img2, { token: viewerTok })).status, 201);
+      const r = await api(`/_api/users/${viewerId}/roles/editor`, { method: 'DELETE', token: adminTok });
+      assert.equal(r.status, 200);
+      const relogin = await api('/_api/auth/login', { method: 'POST', json: { login: 'vi', password: 'reset-by-admin-1' } });
+      viewerTok = relogin.body.token;
+      assert.equal((await put('no-longer-editor.jpg', img2, { token: viewerTok, awaitIndex: false })).status, 401);
+      assert.equal((await api(`/_api/users/${viewerId}/roles/editor`, { method: 'DELETE', token: adminTok })).status, 404);
+    });
+
+    await t('users: disabling an account revokes its sessions and blocks login', async () => {
+      const doomed = await api('/_api/users', { method: 'POST', token: adminTok, json: { email: 'off@test.local', username: 'off', password: 'disabled-pw-1', role: 'viewer' } });
+      const tok = (await api('/_api/auth/login', { method: 'POST', json: { login: 'off', password: 'disabled-pw-1' } })).body.token;
+      assert.equal((await api('/_api/auth/me', { token: tok })).status, 200);
+      const r = await api(`/_api/users/${doomed.body.user.id}/status`, { method: 'POST', token: adminTok, json: { status: 'disabled' } });
+      assert.equal(r.status, 200);
+      assert.equal((await api('/_api/auth/me', { token: tok })).status, 401, 'live sessions die with the account');
+      assert.equal((await api('/_api/auth/login', { method: 'POST', json: { login: 'off', password: 'disabled-pw-1' } })).status, 401);
+      // …and re-enabling restores access.
+      assert.equal((await api(`/_api/users/${doomed.body.user.id}/status`, { method: 'POST', token: adminTok, json: { status: 'active' } })).status, 200);
+      assert.equal((await api('/_api/auth/login', { method: 'POST', json: { login: 'off', password: 'disabled-pw-1' } })).status, 200);
+      disabledUserId = doomed.body.user.id;
+    });
+
+    await t('users: the last admin cannot be disabled, demoted or deleted', async () => {
+      const adminId = (await api('/_api/auth/me', { token: adminTok })).body.user.id;
+      const disable = await api(`/_api/users/${adminId}/status`, { method: 'POST', token: adminTok, json: { status: 'disabled' } });
+      assert.equal(disable.status, 409);
+      assert.equal(disable.body.error, 'self_disable');
+      // Even from another admin's session, the last-admin guard holds.
+      await api('/_api/users', { method: 'POST', token: adminTok, json: { email: 'a2@test.local', username: 'a2', password: 'admin2-pw-12', role: 'admin' } });
+      const a2 = (await api('/_api/auth/login', { method: 'POST', json: { login: 'a2', password: 'admin2-pw-12' } })).body.token;
+      // With two admins, demoting one is allowed…
+      assert.equal((await api(`/_api/users/${adminId}/roles/admin`, { method: 'DELETE', token: a2 })).status, 200);
+      // …and now `a2` is the last one, so it cannot be demoted or deleted.
+      const a2id = (await api('/_api/auth/me', { token: a2 })).body.user.id;
+      const demote = await api(`/_api/users/${a2id}/roles/admin`, { method: 'DELETE', token: a2 });
+      assert.equal(demote.status, 409);
+      assert.equal(demote.body.error, 'last_admin');
+      // Restore the original admin so the rest of the suite still has one.
+      assert.equal((await api(`/_api/users/${adminId}/roles`, { method: 'POST', token: a2, json: { role: 'admin' } })).status, 200);
+      adminTok = (await api('/_api/auth/login', { method: 'POST', json: { login: 'admin', password: 'adminpw-123' } })).body.token;
+    });
+
+    await t('users: deleting orphans their files by default, and never touches the bytes', async () => {
+      const victim = await api('/_api/users', { method: 'POST', token: adminTok, json: { email: 'gone@test.local', username: 'gone', password: 'gone-pw-1234', role: 'editor' } });
+      const vt = (await api('/_api/auth/login', { method: 'POST', json: { login: 'gone', password: 'gone-pw-1234' } })).body.token;
+      await put('owned/by-gone.jpg', img2, { token: vt });
+      assert.equal((await fileRow('owned/by-gone.jpg')).owner_user_id, victim.body.user.id);
+      const r = await api(`/_api/users/${victim.body.user.id}`, { method: 'DELETE', token: adminTok });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.files, 'orphan');
+      assert.equal((await fileRow('owned/by-gone.jpg')).owner_user_id, null, 'the row survives, unowned');
+      assert.equal((await fetch(`${BASE}/owned/by-gone.jpg`)).status, 200, 'the master is untouched');
+      assert.equal((await api('/_api/auth/me', { token: vt })).status, 401);
+    });
+
+    await t('users: deleting with ?files=reassign transfers ownership', async () => {
+      const victim = await api('/_api/users', { method: 'POST', token: adminTok, json: { email: 'gone2@test.local', username: 'gone2', password: 'gone2-pw-123', role: 'editor' } });
+      const vt = (await api('/_api/auth/login', { method: 'POST', json: { login: 'gone2', password: 'gone2-pw-123' } })).body.token;
+      await put('owned/by-gone2.jpg', img2, { token: vt });
+      const r = await api(`/_api/users/${victim.body.user.id}?files=reassign&to=${editorId}`, { method: 'DELETE', token: adminTok });
+      assert.equal(r.status, 200);
+      assert.equal(r.body.files, 'reassign');
+      assert.equal((await fileRow('owned/by-gone2.jpg')).owner_user_id, editorId);
+      const bad = await api(`/_api/users/${disabledUserId}?files=reassign&to=999999`, { method: 'DELETE', token: adminTok });
+      assert.equal(bad.status, 400);
+    });
+
+    await t('users: an admin cannot delete their own account', async () => {
+      const adminId = (await api('/_api/auth/me', { token: adminTok })).body.user.id;
+      const r = await api(`/_api/users/${adminId}`, { method: 'DELETE', token: adminTok });
+      assert.equal(r.status, 409);
+      assert.equal(r.body.error, 'self_delete');
+    });
+
+    // ── multi-factor authentication ───────────────────────────────────────────
+    await t('mfa: enrolment needs a working code before it turns anything on', async () => {
+      await api('/_api/users', { method: 'POST', token: adminTok, json: { email: 'mfa@test.local', username: 'mfauser', password: 'mfa-pw-12345', role: 'viewer' } });
+      mfaTok = (await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345' } })).body.token;
+      const setup = await api('/_api/auth/mfa/setup', { method: 'POST', token: mfaTok });
+      assert.equal(setup.status, 200);
+      assert.match(setup.body.secret, /^[A-Z2-7]{32}$/);
+      assert.match(setup.body.otpauth_url, /^otpauth:\/\/totp\//);
+      mfaSecret = setup.body.secret;
+      // Still off until proven.
+      assert.equal((await api('/_api/auth/me', { token: mfaTok })).body.mfa.enabled, false);
+      assert.equal((await api('/_api/auth/mfa/enable', { method: 'POST', token: mfaTok, json: { code: '000000' } })).status, 400);
+      const on = await api('/_api/auth/mfa/enable', { method: 'POST', token: mfaTok, json: { code: totp.currentCode(mfaSecret) } });
+      assert.equal(on.status, 200);
+      assert.equal(on.body.recovery_codes.length, 10);
+      mfaRecovery = on.body.recovery_codes;
+      assert.equal((await api('/_api/auth/me', { token: mfaTok })).body.mfa.enabled, true);
+    });
+
+    await t('mfa: login now demands the second factor', async () => {
+      const noCode = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345' } });
+      assert.equal(noCode.status, 401);
+      assert.equal(noCode.body.error, 'mfa_required', 'and says so, distinctly from a bad password');
+      const wrong = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345', mfa_code: '000000' } });
+      assert.equal(wrong.body.error, 'mfa_required');
+      const ok = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345', mfa_code: totp.currentCode(mfaSecret) } });
+      assert.equal(ok.status, 200);
+      assert.ok(ok.body.token);
+      // A wrong password is still a wrong password, code or no code.
+      const badPw = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'not-it-at-all', mfa_code: totp.currentCode(mfaSecret) } });
+      assert.equal(badPw.body.error, 'bad_credentials');
+    });
+
+    await t('mfa: a recovery code logs in once and is then spent', async () => {
+      const code = mfaRecovery[0];
+      const first = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345', mfa_code: code } });
+      assert.equal(first.status, 200);
+      const second = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345', mfa_code: code } });
+      assert.equal(second.status, 401, 'a recovery code is single-use');
+      assert.equal((await api('/_api/auth/me', { token: first.body.token })).body.mfa.recoveryCodesRemaining, 9);
+    });
+
+    await t('mfa: an enrolled account cannot use WebDAV Basic auth with its password', async () => {
+      // Basic auth has nowhere to carry a second factor — an API token is the way in.
+      assert.equal((await dav('', { method: 'PROPFIND', headers: basicH('mfauser', 'mfa-pw-12345') })).status, 401);
+    });
+
+    await t('mfa: an admin reset restores access when the authenticator is lost', async () => {
+      const mfaUserId = (await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345', mfa_code: totp.currentCode(mfaSecret) } })).body.user.id;
+      assert.equal((await api(`/_api/users/${mfaUserId}/mfa/reset`, { method: 'POST', token: adminTok })).status, 200);
+      const plain = await api('/_api/auth/login', { method: 'POST', json: { login: 'mfauser', password: 'mfa-pw-12345' } });
+      assert.equal(plain.status, 200, 'password alone works again');
+    });
+
+    // ── session sweeper ───────────────────────────────────────────────────────
+    await t('sweep: expired sessions and API tokens are purged, not left to rot', async () => {
+      const conn = await inspectConn();
+      await conn.query("INSERT INTO sessions (id, user_id, expires_at) VALUES (REPEAT('a',64), ?, DATE_SUB(NOW(), INTERVAL 1 DAY))", [editorId]);
+      const [before] = await conn.query("SELECT COUNT(*) AS n FROM sessions WHERE expires_at < NOW()");
+      assert.ok(Number(before[0].n) > 0, 'an expired session exists to sweep');
+      const r = await api('/_api/jobs', { method: 'POST', token: adminTok, json: { type: 'sweep', payload: { repeat: false } } });
+      assert.equal(r.status, 202);
+      const done = await waitJob(r.body.job.id);
+      assert.equal(done.state, 'done');
+      assert.ok(jsonOf(done.result).sessions >= 1);
+      const [after] = await conn.query("SELECT COUNT(*) AS n FROM sessions WHERE expires_at < NOW()");
+      assert.equal(Number(after[0].n), 0);
+      const [tok] = await conn.query('SELECT COUNT(*) AS n FROM api_tokens WHERE expires_at IS NOT NULL AND expires_at < NOW()');
+      assert.equal(Number(tok[0].n), 0, 'expired API tokens go too');
+    });
+
+    // ── login throttling (last: it deliberately fills the attempt table) ──────
+    await t('throttle: repeated failures lock the account with a Retry-After', async () => {
+      const login = 'ed';
+      for (let i = 0; i < 4; i++) {
+        const r = await api('/_api/auth/login', { method: 'POST', json: { login, password: `wrong-${i}` } });
+        assert.equal(r.status, 401, `attempt ${i + 1} should still be a plain rejection`);
+      }
+      const locked = await api('/_api/auth/login', { method: 'POST', json: { login, password: 'editorpw-123' } });
+      assert.equal(locked.status, 429, 'the CORRECT password is refused while locked');
+      assert.equal(locked.body.error, 'too_many_attempts');
+      assert.ok(Number(locked.headers.get('retry-after')) > 0);
+      // Another account from the same IP is unaffected — the per-IP threshold is
+      // deliberately far higher, so one user's bad night is not everyone's.
+      assert.equal((await api('/_api/auth/login', { method: 'POST', json: { login: 'admin', password: 'adminpw-123' } })).status, 200);
+      // Clear the lock so nothing downstream inherits it.
+      const conn = await inspectConn();
+      await conn.query('DELETE FROM login_attempts');
+      assert.equal((await api('/_api/auth/login', { method: 'POST', json: { login, password: 'editorpw-123' } })).status, 200);
+    });
+
+    await t('audit: the security-relevant events all leave a trail', async () => {
+      const r = await api('/_api/audit?limit=1000', { token: adminTok });
+      const actions = new Set(r.body.events.map((e) => e.action));
+      for (const a of ['password_change', 'password_reset', 'user_disable', 'user_delete', 'role_revoke', 'token_create', 'mfa_enable', 'login_locked']) {
+        assert.ok(actions.has(a), `audit must record "${a}"`);
+      }
+    });
+
+    // ── READ_AUTH_MODE enforcement ────────────────────────────────────────────
+    // The setting was parsed and read by nothing: READ_AUTH_MODE=private booted
+    // cleanly and left every master world-readable. These two nodes prove it means
+    // something now — and that the default mode is genuinely untouched (the origin
+    // suite's whole DB-less run is the control for that).
+    await withNode({
+      label: 'mixedauth', port: PORT + 3, dbName: `${DB_NAME}_mixed`,
+      env: { READ_AUTH_MODE: 'mixed', PRIVATE_PATHS: 'secret', CLUSTER_SECRET: 'peer-secret-1' },
+      seed: { 'open.jpg': img, 'secret/hidden.jpg': img2 },
+    }, async (node) => {
+      const rootTok = await bootstrapAdmin(node.base);
+      await t('read-auth mixed: public masters stay open to anyone', async () => {
+        assert.equal((await fetch(`${node.base}/open.jpg`)).status, 200);
+        assert.equal((await fetch(`${node.base}/open.jpg?w=100`)).status, 200, 'including resizes');
+      });
+      await t('read-auth mixed: a private master needs credentials', async () => {
+        const r = await fetch(`${node.base}/secret/hidden.jpg`);
+        assert.equal(r.status, 401);
+        assert.equal((await fetch(`${node.base}/secret/hidden.jpg?w=50`)).status, 401, 'and so does its resize');
+      });
+      await t('read-auth mixed: a signed-in user, the upload token, and a peer all get in', async () => {
+        assert.equal((await fetch(`${node.base}/secret/hidden.jpg`, { headers: authH(rootTok) })).status, 200);
+        assert.equal((await fetch(`${node.base}/secret/hidden.jpg`, { headers: authH(TOKEN) })).status, 200);
+        assert.equal((await fetch(`${node.base}/secret/hidden.jpg`, { headers: { 'X-Cluster-Secret': 'peer-secret-1' } })).status, 200);
+        assert.equal((await fetch(`${node.base}/secret/hidden.jpg`, { headers: { 'X-Cluster-Secret': 'wrong' } })).status, 401);
+      });
+      await t('read-auth mixed: a share link is still an explicit grant for a private file', async () => {
+        // Index the master first — a share needs a row, and nothing has written one.
+        const scan = await fetch(`${node.base}/_api/jobs`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', ...authH(rootTok) },
+          body: JSON.stringify({ type: 'scan' }) });
+        const jobId = (await scan.json()).job.id;
+        await waitFor(async () => {
+          const r = await fetch(`${node.base}/_api/jobs/${jobId}`, { headers: authH(rootTok) });
+          return (await r.json()).job.state === 'done';
+        }, 200, 100);
+        const share = await fetch(`${node.base}/_api/shares`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', ...authH(rootTok) },
+          body: JSON.stringify({ path: 'secret/hidden.jpg' }) });
+        assert.equal(share.status, 201);
+        const { relativeUrl } = await share.json();
+        const got = await fetch(node.base + relativeUrl);
+        assert.equal(got.status, 200, 'the share serves the private file with no credentials at all');
+      });
+    });
+
+    await withNode({
+      label: 'privauth', port: PORT + 4, dbName: `${DB_NAME}_priv`,
+      env: { READ_AUTH_MODE: 'private', SECURE_COOKIES: 'always' },
+      seed: { 'anything.jpg': img },
+    }, async (node) => {
+      await t('read-auth private: every read needs credentials, even a public path', async () => {
+        assert.equal((await fetch(`${node.base}/anything.jpg`)).status, 401);
+        assert.equal((await fetch(`${node.base}/missing.jpg`)).status, 401, 'and a miss leaks nothing about existence');
+        assert.equal((await fetch(`${node.base}/anything.jpg`, { headers: authH(TOKEN) })).status, 200);
+      });
+      await t('read-auth private: /_health stays open so probes keep working', async () => {
+        assert.equal((await fetch(`${node.base}/_health`)).status, 200);
+      });
+      await t('secure transport: SECURE_COOKIES=always refuses WebDAV Basic auth over plain HTTP', async () => {
+        const rootTok = await bootstrapAdmin(node.base);
+        assert.ok(rootTok);
+        const r = await fetch(`${node.base}/_dav/`, { method: 'PROPFIND', headers: basicH('root', 'rootpw-12345') });
+        assert.equal(r.status, 403);
+        assert.match(await r.text(), /HTTPS/);
+      });
+      await t('secure transport: SECURE_COOKIES=always marks the session cookie Secure', async () => {
+        const r = await fetch(`${node.base}/_api/auth/login`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ login: 'root', password: 'rootpw-12345' }) });
+        assert.match(r.headers.get('set-cookie') || '', /;\s*Secure/);
+      });
+    });
+
+    await t('secure transport: the default (auto) leaves a plain-HTTP dev cookie usable', async () => {
+      const r = await api('/_api/auth/login', { method: 'POST', json: { login: 'admin', password: 'adminpw-123' } });
+      assert.doesNotMatch(r.headers.get('set-cookie') || '', /;\s*Secure/, 'no Secure flag on a cleartext hop…');
+      const fwd = await api('/_api/auth/login', {
+        method: 'POST', json: { login: 'admin', password: 'adminpw-123' },
+        headers: { 'X-Forwarded-Proto': 'https' } });
+      assert.match(fwd.headers.get('set-cookie') || '', /;\s*Secure/, '…but yes behind a TLS-terminating proxy');
+      adminTok = fwd.body.token;
+    });
+
     // ── unknown routes ────────────────────────────────────────────────────────
     await t('api: unknown route → 404, wrong method on a known route → 405', async () => {
       assert.equal((await api('/_api/nope', { token: adminTok })).status, 404);
@@ -1085,7 +1475,7 @@ async function dropDatabase() {
   dropped = true;
   for (const conn of inspectConns.values()) await conn.end().catch(() => {});
   inspectConns.clear();
-  for (const name of [DB_NAME, DB_NAME_PULL]) {
+  for (const name of [DB_NAME, ...extraDatabases]) {
     try {
       await withDbConn((conn) => conn.query(`DROP DATABASE IF EXISTS \`${name}\``));
     } catch (e) {

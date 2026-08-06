@@ -83,7 +83,8 @@ function setAuthMode(mode) {
   $('#f-email').required = reg;
   $('#switch-text').textContent = reg ? 'Already have an account?' : 'First time here?';
   $('#switch-link').textContent = reg ? 'Sign in' : 'Create the admin account';
-  $('#f-login').previousSibling; // no-op
+  $('#f-mfa-wrap').classList.add('hidden');
+  $('#f-mfa').value = '';
   $('#auth-error').classList.add('hidden');
 }
 $('#switch-link').addEventListener('click', (e) => { e.preventDefault(); setAuthMode(S.authMode === 'login' ? 'register' : 'login'); });
@@ -98,11 +99,22 @@ $('#auth-form').addEventListener('submit', async (e) => {
     if (S.authMode === 'register') {
       r = await api('POST', '/_api/auth/register', { email: $('#f-email').value.trim(), username: login, password });
     } else {
-      r = await api('POST', '/_api/auth/login', { login, password });
+      const mfa_code = $('#f-mfa').value.trim();
+      r = await api('POST', '/_api/auth/login', { login, password, ...(mfa_code ? { mfa_code } : {}) });
     }
     setSession(r.token, r.user, r.roles);
     enterApp();
   } catch (err) {
+    const code = err.json && err.json.error;
+    // The password was right and a second factor is owed — reveal the field and let
+    // them finish, rather than reporting it as a failed sign-in.
+    if (code === 'mfa_required') {
+      $('#f-mfa-wrap').classList.remove('hidden');
+      $('#f-mfa').focus();
+      errBox.textContent = $('#f-mfa').value ? 'That code was not accepted. Try again.' : 'Enter the code from your authenticator app.';
+      errBox.classList.remove('hidden');
+      return;
+    }
     errBox.textContent = err.status === 503 ? 'The database layer is not enabled on this server.' : (err.message || 'Failed');
     errBox.classList.remove('hidden');
   }
@@ -162,8 +174,8 @@ async function refreshStats() {
 }
 
 // ── Router ───────────────────────────────────────────────────────────────────
-const VIEWS = { files: filesView, upload: uploadView, shares: sharesView, users: usersView, jobs: jobsView, audit: auditView };
-const TITLES = { files: 'Files', upload: 'Upload', shares: 'Share links', users: 'Users', jobs: 'Background jobs', audit: 'Audit log' };
+const VIEWS = { files: filesView, upload: uploadView, shares: sharesView, account: accountView, users: usersView, jobs: jobsView, audit: auditView };
+const TITLES = { files: 'Files', upload: 'Upload', shares: 'Share links', account: 'Account & security', users: 'Users', jobs: 'Background jobs', audit: 'Audit log' };
 const ADMIN_VIEWS = new Set(['users', 'jobs', 'audit']);
 function route() {
   if (!S.token) return showAuth();
@@ -556,6 +568,162 @@ function uploadOne(file, prefix, visibility, list) {
   xhr.send(file);
 }
 
+// ── Account view ─────────────────────────────────────────────────────────────
+// Everything a user can do about their own security in one place: change the
+// password, enrol a second factor, and mint the API tokens that scripts and WebDAV
+// clients use instead of a password.
+async function accountView(root) {
+  const pwPanel = el('div', { class: 'panel' },
+    el('h3', {}, 'Change password'),
+    el('div', { class: 'row' },
+      el('label', {}, 'Current password', el('input', { id: 'pw-old', type: 'password', autocomplete: 'current-password' })),
+      el('label', {}, 'New password', el('input', { id: 'pw-new', type: 'password', autocomplete: 'new-password' })),
+      el('button', { class: 'btn btn-primary', onclick: changePassword }, 'Change'),
+    ),
+    el('p', { class: 'muted', style: 'font-size:12px;margin:8px 0 0' },
+      'Changing your password signs out every other session — this one stays.'),
+  );
+  const mfaPanel = el('div', { class: 'panel' }, el('h3', {}, 'Two-factor authentication'), el('div', { id: 'mfa-body' }, 'Loading…'));
+  const tokPanel = el('div', { class: 'panel' },
+    el('h3', {}, 'API tokens'),
+    el('p', { class: 'muted', style: 'font-size:12px;margin:0 0 10px' },
+      'Long-lived credentials for scripts, CI and WebDAV clients. A token acts as you and can be revoked ' +
+      'on its own — and it is the way in for an account with two-factor enabled, since Basic auth has ' +
+      'nowhere to put a code.'),
+    el('div', { class: 'row' },
+      el('label', {}, 'Name', el('input', { id: 'tok-name', placeholder: 'e.g. ci-pipeline' })),
+      el('label', {}, 'Expires in (days, optional)', el('input', { id: 'tok-days', type: 'number', min: '1', placeholder: 'never' })),
+      el('button', { class: 'btn btn-primary', onclick: createToken }, 'Create token'),
+    ),
+    el('div', { id: 'tok-table', style: 'margin-top:14px' }, 'Loading…'),
+  );
+  root.append(pwPanel, mfaPanel, tokPanel);
+  loadMfa();
+  loadTokens();
+
+  async function changePassword() {
+    try {
+      await api('POST', '/_api/auth/password', { old_password: $('#pw-old').value, new_password: $('#pw-new').value });
+      $('#pw-old').value = ''; $('#pw-new').value = '';
+      toast('Password changed; other sessions signed out', 'ok');
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function loadMfa() {
+    const box = $('#mfa-body');
+    try {
+      const me = await api('GET', '/_api/auth/me');
+      box.innerHTML = '';
+      if (!me.mfa || !me.mfa.available) {
+        box.append(el('div', { class: 'muted' }, 'Not enabled on this server (set MFA_ENABLED=1).'));
+        return;
+      }
+      if (me.mfa.enabled) {
+        box.append(
+          el('div', {}, '🔒 ', el('b', {}, 'Enabled'), ` · ${me.mfa.recoveryCodesRemaining} recovery code(s) left`),
+          el('div', { class: 'preview-actions', style: 'margin-top:12px' },
+            el('button', { class: 'btn', onclick: () => withPassword('New recovery codes — confirm your password:', (password) => api('POST', '/_api/auth/mfa/recovery', { password }).then((r) => showCodes(r.recovery_codes))) }, 'New recovery codes'),
+            el('button', { class: 'btn btn-danger', onclick: () => withPassword('Turn off two-factor — confirm your password:', (password) => api('POST', '/_api/auth/mfa/disable', { password }).then(() => { toast('Two-factor disabled', 'ok'); loadMfa(); })) }, 'Turn off'),
+          ),
+        );
+        return;
+      }
+      box.append(
+        el('div', { class: 'muted' }, 'Off. Enrol an authenticator app (Google Authenticator, 1Password, Aegis…).'),
+        el('div', { class: 'preview-actions', style: 'margin-top:12px' },
+          el('button', { class: 'btn btn-primary', onclick: startEnrol }, 'Set up two-factor')),
+      );
+    } catch (err) { box.textContent = err.message; }
+  }
+
+  async function startEnrol() {
+    try {
+      const s = await api('POST', '/_api/auth/mfa/setup');
+      const box = $('#mfa-body');
+      box.innerHTML = '';
+      box.append(
+        el('p', {}, 'Add this secret to your authenticator app, then enter the 6-digit code it shows.'),
+        el('code', { style: 'display:block;padding:10px;border-radius:8px;background:var(--panel-2, #0002);word-break:break-all;margin-bottom:10px' }, s.secret),
+        el('p', { class: 'muted', style: 'font-size:12px' }, 'Or open this URI on the device: ', el('code', { style: 'word-break:break-all' }, s.otpauth_url)),
+        el('div', { class: 'row' },
+          el('label', {}, 'Code', el('input', { id: 'mfa-code', inputmode: 'numeric', placeholder: '123456', maxlength: '6' })),
+          el('button', { class: 'btn btn-primary', onclick: finishEnrol }, 'Verify & enable'),
+          el('button', { class: 'btn', onclick: loadMfa }, 'Cancel'),
+        ),
+      );
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function finishEnrol() {
+    try {
+      const r = await api('POST', '/_api/auth/mfa/enable', { code: $('#mfa-code').value.trim() });
+      showCodes(r.recovery_codes);
+      loadMfa();
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  // Recovery codes exist for exactly one moment; make that moment hard to miss.
+  function showCodes(codes) {
+    showModal(el('div', { class: 'preview-info' },
+      el('h3', {}, 'Recovery codes'),
+      el('p', { class: 'muted' }, 'Each works once, if you lose your authenticator. They are not shown again.'),
+      el('pre', { style: 'padding:12px;border-radius:8px;background:var(--panel-2, #0002);overflow:auto' }, codes.join('\n')),
+      el('div', { class: 'preview-actions' },
+        el('button', { class: 'btn', onclick: () => navigator.clipboard.writeText(codes.join('\n')).then(() => toast('Copied', 'ok')) }, 'Copy'),
+      ),
+    ));
+  }
+
+  async function withPassword(prompt_, fn) {
+    const password = prompt(prompt_);
+    if (password === null) return;
+    try { await fn(password); } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function loadTokens() {
+    try {
+      const r = await api('GET', '/_api/tokens');
+      const box = $('#tok-table');
+      box.innerHTML = '';
+      if (!r.tokens.length) { box.append(el('div', { class: 'empty' }, el('div', { class: 'big' }, '🔑'), 'No API tokens yet.')); return; }
+      box.append(el('table', {},
+        el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Created'), el('th', {}, 'Last used'), el('th', {}, 'Expires'), el('th', {}, ''))),
+        el('tbody', {}, ...r.tokens.map((tk) => el('tr', {},
+          el('td', {}, tk.name),
+          el('td', {}, fmtDate(tk.created_at)),
+          el('td', {}, tk.last_used_at ? fmtDate(tk.last_used_at) : 'never'),
+          el('td', {}, tk.expires_at ? (tk.expired ? el('span', { class: 'over' }, 'expired') : fmtDate(tk.expires_at)) : '—'),
+          el('td', {}, el('button', { class: 'btn btn-sm btn-danger', onclick: () => revokeToken(tk) }, 'Revoke')),
+        ))),
+      ));
+    } catch (err) { $('#tok-table').textContent = err.message; }
+  }
+
+  async function createToken() {
+    const name = $('#tok-name').value.trim();
+    if (!name) return toast('Give the token a name', 'err');
+    const days = $('#tok-days').value.trim();
+    try {
+      const r = await api('POST', '/_api/tokens', { name, expires_in_days: days ? Number(days) : null });
+      $('#tok-name').value = ''; $('#tok-days').value = '';
+      showModal(el('div', { class: 'preview-info' },
+        el('h3', {}, 'Copy this token now'),
+        el('p', { class: 'muted' }, 'It is stored hashed and cannot be shown again.'),
+        el('pre', { style: 'padding:12px;border-radius:8px;background:var(--panel-2, #0002);overflow:auto;word-break:break-all' }, r.token),
+        el('div', { class: 'preview-actions' },
+          el('button', { class: 'btn', onclick: () => navigator.clipboard.writeText(r.token).then(() => toast('Copied', 'ok')) }, 'Copy')),
+      ));
+      loadTokens();
+    } catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function revokeToken(tk) {
+    if (!confirm(`Revoke "${tk.name}"? Anything using it stops working immediately.`)) return;
+    try { await api('DELETE', `/_api/tokens/${tk.id}`); toast('Revoked', 'ok'); loadTokens(); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+}
+
 // ── Jobs view (admin) ────────────────────────────────────────────────────────
 // The window onto background work: what the worker is, what is queued, and the one
 // button an operator actually needs after mounting an existing master directory —
@@ -711,14 +879,85 @@ async function usersView(root) {
           el('td', {}, String(u.id)),
           el('td', {}, u.username),
           el('td', {}, u.email),
-          el('td', {}, (u.roles || []).join(', ')),
+          el('td', {}, rolesCell(u)),
           el('td', {}, storageCell(u)),
-          el('td', {}, u.status),
-          el('td', {}, el('button', { class: 'btn btn-sm', onclick: () => setQuota(u) }, 'Quota')),
+          el('td', {}, el('span', { class: u.status === 'disabled' ? 'over' : '' }, u.status), u.mfa_enabled ? ' 🔒' : ''),
+          el('td', {}, el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap' },
+            el('button', { class: 'btn btn-sm', onclick: () => setQuota(u) }, 'Quota'),
+            el('button', { class: 'btn btn-sm', onclick: () => grantRole(u) }, '+ Role'),
+            el('button', { class: 'btn btn-sm', onclick: () => resetPassword(u) }, 'Reset password'),
+            u.mfa_enabled ? el('button', { class: 'btn btn-sm', onclick: () => resetMfa(u) }, 'Reset 2FA') : null,
+            el('button', { class: 'btn btn-sm', onclick: () => toggleStatus(u) }, u.status === 'disabled' ? 'Enable' : 'Disable'),
+            el('button', { class: 'btn btn-sm btn-danger', onclick: () => removeUser(u) }, 'Delete'),
+          )),
         ))),
       );
       $('#users-table').innerHTML = ''; $('#users-table').append(t);
+      S.userList = r.users;
     } catch (err) { $('#users-table').textContent = err.message; }
+  }
+
+  // Each role is a chip with its own revoke affordance — the route table could grant
+  // roles and never take one back, so a mis-click promoting someone was permanent.
+  function rolesCell(u) {
+    const wrap = el('span', { style: 'display:flex;gap:4px;flex-wrap:wrap' });
+    for (const r of u.roles || []) {
+      wrap.append(el('span', { class: 'badge' }, r, ' ',
+        el('a', { href: '#', title: `Revoke ${r}`, onclick: (e) => { e.preventDefault(); revokeRole(u, r); } }, '×')));
+    }
+    return wrap;
+  }
+
+  async function revokeRole(u, role) {
+    if (!confirm(`Revoke "${role}" from ${u.username}? Their sessions are signed out.`)) return;
+    try { await api('DELETE', `/_api/users/${u.id}/roles/${role}`); toast('Role revoked', 'ok'); loadUsers(); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function grantRole(u) {
+    const role = prompt(`Grant which role to ${u.username}? (admin / editor / viewer)`);
+    if (!role) return;
+    try { await api('POST', `/_api/users/${u.id}/roles`, { role: role.trim().toLowerCase() }); toast('Role granted', 'ok'); loadUsers(); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function toggleStatus(u) {
+    const next = u.status === 'disabled' ? 'active' : 'disabled';
+    if (next === 'disabled' && !confirm(`Disable ${u.username}? Their sessions end immediately.`)) return;
+    try { await api('POST', `/_api/users/${u.id}/status`, { status: next }); toast(`Account ${next}`, 'ok'); loadUsers(); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function resetPassword(u) {
+    const pw = prompt(`New password for ${u.username} (they will be signed out everywhere):`);
+    if (!pw) return;
+    try { await api('POST', `/_api/users/${u.id}/password`, { new_password: pw }); toast('Password reset', 'ok'); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+
+  async function resetMfa(u) {
+    if (!confirm(`Turn off two-factor for ${u.username}? Use this when they have lost both their authenticator and their recovery codes.`)) return;
+    try { await api('POST', `/_api/users/${u.id}/mfa/reset`, {}); toast('Two-factor reset', 'ok'); loadUsers(); }
+    catch (err) { toast(err.message, 'err'); }
+  }
+
+  // Deleting an account is not a way to delete data: the masters are never touched,
+  // and the operator chooses explicitly what happens to the rows that point at them.
+  async function removeUser(u) {
+    const choice = prompt(
+      `Delete ${u.username}?\n\nTheir files are NOT deleted. Type:\n` +
+      `  orphan   — keep the files with no owner (default)\n` +
+      `  <username> — transfer ownership to that user\n\nOr Cancel.`, 'orphan');
+    if (choice === null) return;
+    let query = '?files=orphan';
+    const target = choice.trim();
+    if (target && target !== 'orphan') {
+      const to = (S.userList || []).find((x) => x.username === target);
+      if (!to) return toast(`No user "${target}"`, 'err');
+      query = `?files=reassign&to=${to.id}`;
+    }
+    try { await api('DELETE', `/_api/users/${u.id}${query}`); toast('User deleted', 'ok'); loadUsers(); }
+    catch (err) { toast(err.message, 'err'); }
   }
   function storageCell(u) {
     const used = fmtBytes(u.used_bytes || 0);

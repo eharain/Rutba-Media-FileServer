@@ -53,9 +53,13 @@ function start(config = loadConfig()) {
     // The background worker only exists alongside the DB layer, and only starts once
     // the layer actually came up. Nothing in the request path depends on it.
     jobs.start();
-    if (jobs.enabled && config.scanOnBoot) {
-      jobs.enqueue('scan', {}, { dedupeKey: 'scan:all', priority: 8 })
-        .then((id) => id && console.log(`[media] jobs: boot scan queued as job ${id}`));
+    if (jobs.enabled) {
+      // Housekeeping runs from boot and then re-queues itself (see jobtypes.js).
+      jobs.enqueue('sweep', { repeat: true }, { dedupeKey: 'sweep:housekeeping', priority: 9 });
+      if (config.scanOnBoot) {
+        jobs.enqueue('scan', {}, { dedupeKey: 'scan:all', priority: 8 })
+          .then((id) => id && console.log(`[media] jobs: boot scan queued as job ${id}`));
+      }
     }
     server.listen(config.port, config.host, () =>
       console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, storage ${volInfo}, sharp ${sharp ? 'on' : 'OFF'}, ffmpeg ${ffmpeg.enabled ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}, cluster ${clusterInfo}, db ${db.enabled ? 'on' : 'OFF'}, jobs ${jobs.workerRunning ? 'on' : 'OFF'}`));

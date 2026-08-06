@@ -117,6 +117,27 @@ function loadConfig(env = process.env) {
     allowRegistration: /^(1|true|yes|on)$/i.test(env.ALLOW_REGISTRATION || ''),
     // Session lifetime (days) for issued login tokens.
     sessionTtlDays: parseInt(env.SESSION_TTL_DAYS, 10) || 30,
+    // `Secure` flag on the session cookie, and whether credentials may travel over a
+    // cleartext hop at all: auto (secure when the request arrived over TLS) |
+    // always (also refuses WebDAV Basic auth over plain HTTP) | never.
+    secureCookies: ['always', 'never'].includes((env.SECURE_COOKIES || '').toLowerCase())
+      ? env.SECURE_COOKIES.toLowerCase() : 'auto',
+    // Failed-login throttling. A per-account and per-IP counter over `audit_log`;
+    // 0 failures disables it entirely.
+    loginMaxFailures: parseInt(env.LOGIN_MAX_FAILURES, 10) || 10,
+    // The per-IP threshold is deliberately much higher than the per-account one.
+    // They stop different attacks — one password list against one account, versus one
+    // client spraying many accounts — and a per-IP limit set as tightly as the
+    // per-account limit locks out everyone behind a single NAT or corporate proxy the
+    // moment one of them fat-fingers a password.
+    loginMaxFailuresIp: parseInt(env.LOGIN_MAX_FAILURES_IP, 10) || (parseInt(env.LOGIN_MAX_FAILURES, 10) || 10) * 5,
+    loginWindowMinutes: parseInt(env.LOGIN_WINDOW_MINUTES, 10) || 15,
+    loginLockoutMinutes: parseInt(env.LOGIN_LOCKOUT_MINUTES, 10) || 15,
+    // TOTP multi-factor authentication. Off by default; when on, users may enrol and
+    // an enrolled user must present a code at login.
+    mfaEnabled: /^(1|true|yes|on)$/i.test(env.MFA_ENABLED || ''),
+    // Issuer shown in authenticator apps.
+    mfaIssuer: env.MFA_ISSUER || 'Rutba Media',
     // WebDAV mount at /_dav/ (needs the DB layer for accounts). On by default when
     // the DB layer is up; set WEBDAV_ENABLED/WEBDAV to 0/false/off to disable.
     webdavEnabled: !/^(0|false|off|no)$/i.test(env.WEBDAV_ENABLED || env.WEBDAV || ''),

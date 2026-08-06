@@ -18,7 +18,7 @@
 
 const path = require('path');
 const crypto = require('crypto');
-const { streamFile, send } = require('../http');
+const { streamFile, send, isSecureRequest } = require('../http');
 const { MIME } = require('../constants');
 const { hasRole } = require('../auth');
 
@@ -46,6 +46,16 @@ function createWebdavHandler({ config, db, auth, storage, masterops }) {
 
   return async function handleDav(req, res, url) {
     if (!enabled()) { send(res, 404, 'Not Found'); return true; }
+
+    // Transport guard. Basic auth puts the password on the wire in base64 — that is
+    // encoding, not encryption. With SECURE_COOKIES=always the operator has declared
+    // this deployment TLS-only, so refuse the credential rather than let a client
+    // send it in the clear. (Refused BEFORE reading the header, so a mistake here
+    // never leaks a password into a log line.)
+    if (config.secureCookies === 'always' && !isSecureRequest(req)) {
+      send(res, 403, 'WebDAV requires HTTPS on this server (SECURE_COOKIES=always)');
+      return true;
+    }
 
     // Basic auth.
     const hdr = req.headers['authorization'] || '';

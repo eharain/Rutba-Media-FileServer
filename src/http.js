@@ -52,6 +52,31 @@ function readJson(req, limit = 1024 * 1024) {
   });
 }
 
+// Did this request reach us over TLS? Behind a terminating proxy (Caddy, nginx,
+// LiteSpeed) the socket is plaintext and the only evidence is the forwarded header,
+// so both are consulted. Used to decide the `Secure` cookie flag and to refuse
+// credentials over a cleartext hop.
+function isSecureRequest(req) {
+  const xfp = req.headers['x-forwarded-proto'];
+  if (xfp && String(xfp).split(',')[0].trim().toLowerCase() === 'https') return true;
+  if (String(req.headers['x-forwarded-ssl'] || '').toLowerCase() === 'on') return true;
+  return !!(req.socket && req.socket.encrypted);
+}
+
+/**
+ * Should the session cookie carry `Secure`? SECURE_COOKIES:
+ *   auto (default) — yes when the request arrived over TLS. A plain-HTTP dev server
+ *                    still works; a TLS deployment gets the flag with no config.
+ *   always         — always, and cleartext credential paths are refused outright.
+ *   never          — never (for a deployment that terminates TLS somewhere this
+ *                    process genuinely cannot observe).
+ */
+function wantSecureCookie(req, mode) {
+  if (mode === 'never') return false;
+  if (mode === 'always') return true;
+  return isSecureRequest(req);
+}
+
 // Best-effort client IP (honors a single X-Forwarded-For hop when behind a proxy).
 function clientIp(req) {
   const xff = req.headers['x-forwarded-for'];
@@ -111,4 +136,4 @@ function streamFile(req, res, filePath, type, stat) {
   s.pipe(res);
 }
 
-module.exports = { setCommon, send, sendJson, readJson, clientIp, streamFile };
+module.exports = { setCommon, send, sendJson, readJson, clientIp, streamFile, isSecureRequest, wantSecureCookie };

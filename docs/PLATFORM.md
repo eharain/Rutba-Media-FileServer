@@ -51,7 +51,14 @@ keeps running with the layer **off** (masters still serve).
 | `SCAN_RATE_FILES_PER_SEC` | `200` | Ceiling on scan throughput, so it never starves request-path I/O |
 | `ALLOW_REGISTRATION` | `false` | Allow open self-service `POST /_api/auth/register`. The **first** account is always allowed (bootstrap admin) regardless. |
 | `SESSION_TTL_DAYS` | `30` | Login session lifetime |
-| `READ_AUTH_MODE` | `public` | `public` (open, as today) · `mixed` (private files need auth) · `private` (all reads need auth). *Reserved — enforcement lands with the read-auth phase; currently reads stay public.* |
+| `READ_AUTH_MODE` | `public` | `public` (open, as today) · `mixed` (private files need auth) · `private` (all reads need auth). **Enforced** — see below. |
+| `SECURE_COOKIES` | `auto` | `Secure` on the session cookie: `auto` (when the request arrived over TLS) · `always` (also refuses WebDAV Basic auth over plain HTTP) · `never` |
+| `LOGIN_MAX_FAILURES` | `10` | Failed logins per account within the window before lockout (`0` disables throttling) |
+| `LOGIN_MAX_FAILURES_IP` | `5×` account | Per-IP threshold. Deliberately much higher — a tight per-IP limit locks out everyone behind one NAT. |
+| `LOGIN_WINDOW_MINUTES` | `15` | Window the failures are counted over |
+| `LOGIN_LOCKOUT_MINUTES` | `15` | How long a lockout lasts, measured from the last failure |
+| `MFA_ENABLED` | `false` | Allow TOTP enrolment; enrolled users must present a code at login |
+| `MFA_ISSUER` | `Rutba Media` | Name shown in authenticator apps |
 
 ## Web console (`/_ui/`)
 
@@ -107,10 +114,23 @@ namespace never collides with media paths (like `/_health`).
 | `POST /_api/auth/register` | open¹ | Create account → `{user, token, roles}` |
 | `POST /_api/auth/login` | — | `{login, password}` → `{user, token, roles}` (+ `sid` cookie) |
 | `POST /_api/auth/logout` | bearer | Invalidate the session |
-| `GET  /_api/auth/me` | bearer | Current user + roles |
+| `GET  /_api/auth/me` | bearer | Current user + roles + MFA state |
+| `POST /_api/auth/password` | bearer | Change own password `{old_password, new_password}` (revokes other sessions) |
+| `POST /_api/auth/mfa/setup` | bearer | Begin TOTP enrolment → `{secret, otpauth_url}` |
+| `POST /_api/auth/mfa/enable` | bearer | Finish enrolment `{code}` → `{recovery_codes}` (shown once) |
+| `POST /_api/auth/mfa/disable` | bearer | Turn TOTP off `{password}` |
+| `POST /_api/auth/mfa/recovery` | bearer | Re-issue recovery codes `{password}` |
+| `GET  /_api/tokens` | bearer | List own API tokens (never the secret) |
+| `POST /_api/tokens` | bearer | Mint one `{name, expires_in_days?}` → plaintext, once |
+| `DELETE /_api/tokens/:id` | owner/admin | Revoke a token |
 | `GET  /_api/users` | admin | List users |
 | `POST /_api/users` | admin | Create user `{email, username, password, role?}` |
+| `DELETE /_api/users/:id` | admin | Delete a user — `?files=orphan` (default) or `?files=reassign&to=<id>` |
+| `POST /_api/users/:id/status` | admin | Enable/disable `{status}` (disabling revokes live sessions) |
+| `POST /_api/users/:id/password` | admin | Reset a password `{new_password}` (revokes all their sessions) |
+| `POST /_api/users/:id/mfa/reset` | admin | Turn off a user's TOTP (lost-authenticator recovery) |
 | `POST /_api/users/:id/roles` | admin | Grant a role `{role}` |
+| `DELETE /_api/users/:id/roles/:role` | admin | Revoke a role (last-admin guarded; revokes their sessions) |
 | `GET  /_api/files` | any user | List/search index: `?q=&type=&visibility=&status=&tag=&limit=&offset=` |
 | `GET  /_api/files/duplicates` | any user | Files grouped by identical `sha256` (+ reclaimable bytes) |
 | `GET  /_api/files/metadata?path=` | any user | Extracted EXIF/media metadata for a file |
@@ -172,6 +192,59 @@ the next scan flips it back to `active`. List them with `/_api/files?status=miss
 Scans are **resumable** (a killed scan continues from its recorded progress rather
 than starting over) and **rate-limited** (`SCAN_RATE_FILES_PER_SEC`) so reconciling a
 large library never starves live requests.
+
+## Read authorization (`READ_AUTH_MODE`)
+
+| Mode | Behavior |
+|---|---|
+| `public` *(default)* | Reads are open to everyone — byte-for-byte the original origin, and the enforcement path costs nothing. |
+| `mixed` | Public-visibility masters stay open; `private` ones need a permitted caller. |
+| `private` | Every read needs one, decided before the master is even resolved. |
+
+A caller is permitted by any of:
+
+1. **`X-Cluster-Secret`** — a sibling node. Pull-on-miss is a GET against a peer, so
+   without this grant, turning on private reads would silently break replication.
+2. **`UPLOAD_TOKEN`** (as `Authorization: Bearer` or `X-Upload-Token`) — the Strapi
+   provider and the migration script, which already write with it.
+3. **A session or API token** for any account with a role.
+
+**Share links are the fourth way in, by design.** `/_s/<token>` streams the file
+itself, and the share *is* the explicit grant — which is what makes it the right way
+to hand out a private file without handing out credentials. A refusal is `401`, not
+`403`: the caller may simply not have sent the credential it has.
+
+Visibility comes from the per-file `X-Visibility` sidecar if one exists, else the
+`PRIVATE_PATHS` rule.
+
+## Accounts, sessions and second factors
+
+- **Passwords** are scrypt-hashed. A self-service change requires the current
+  password and **signs out every other session** — that is the point of changing it.
+  An admin reset needs no old password and signs out all of them.
+- **Login throttling** counts failures per account and per IP over a sliding window,
+  and locks from the *last* failure, so hammering a locked account keeps it locked.
+  A `429` carries `Retry-After`. A missing MFA code is deliberately **not** counted:
+  the password held, and locking someone out for fumbling a 30-second code is a
+  denial of service against your own users.
+- **TOTP** (`MFA_ENABLED=1`) is standard RFC 6238 — HMAC-SHA1, 6 digits, 30-second
+  step — so any authenticator app works. Enrolment is two steps: `setup` mints the
+  secret, and nothing turns on until a working code proves the app is really
+  configured. Ten single-use recovery codes are issued at that moment and never
+  shown again; an admin can clear MFA for a user who has lost both.
+- **API tokens** are the credential for scripts, CI and WebDAV. The plaintext is
+  returned once and only its sha256 is stored. An MFA-enrolled account **cannot** use
+  WebDAV Basic auth with its password — Basic has nowhere to carry a code — so it
+  authenticates with an API token as the password instead.
+- **Sessions** die on logout, on expiry, on a password change, on a role revocation,
+  and when the account is disabled. The `sweep` job removes expired rows on a
+  schedule rather than leaving them until someone happens to present the token.
+
+**Deleting a user never deletes files.** `?files=orphan` (the default) clears the
+owner and keeps every row, its tags and its shares; `?files=reassign&to=<id>`
+transfers ownership, and with it the bytes counted against that user's quota. The
+last active admin cannot be disabled, demoted or deleted — an installation with no
+admin cannot make one.
 
 ## Background jobs
 

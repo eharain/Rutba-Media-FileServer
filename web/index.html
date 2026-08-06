@@ -17,6 +17,11 @@
       <label>Email or username<input id="f-login" name="username" autocomplete="username" required></label>
       <label id="f-email-wrap" class="hidden">Email<input id="f-email" name="email" type="email" autocomplete="email"></label>
       <label>Password<input id="f-password" name="password" type="password" autocomplete="current-password" required></label>
+      <!-- Revealed only after the server says a second factor is owed, so the field
+           never appears for the accounts that don't use one. -->
+      <label id="f-mfa-wrap" class="hidden">Authentication code
+        <input id="f-mfa" name="one-time-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456 or a recovery code">
+      </label>
       <div id="auth-error" class="form-error hidden"></div>
       <button id="auth-submit" type="submit" class="btn btn-primary btn-block">Sign in</button>
       <p class="switch muted">
@@ -34,6 +39,7 @@
         <a href="#/files" data-view="files" class="nav-item">📁 <span>Files</span></a>
         <a href="#/upload" data-view="upload" class="nav-item">⬆️ <span>Upload</span></a>
         <a href="#/shares" data-view="shares" class="nav-item">🔗 <span>Shares</span></a>
+        <a href="#/account" data-view="account" class="nav-item">🔐 <span>Account</span></a>
         <a href="#/users" data-view="users" class="nav-item nav-admin">👥 <span>Users</span></a>
         <a href="#/jobs" data-view="jobs" class="nav-item nav-admin">⚙️ <span>Jobs</span></a>
         <a href="#/audit" data-view="audit" class="nav-item nav-admin">📜 <span>Audit</span></a>

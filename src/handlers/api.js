@@ -29,13 +29,18 @@
  */
 
 const crypto = require('crypto');
-const { sendJson, readJson, clientIp } = require('../http');
-const { hasRole, hashPassword, mysqlDate } = require('../auth');
+const { sendJson, readJson, clientIp, wantSecureCookie } = require('../http');
+const { hasRole, hashPassword, mysqlDate, totp } = require('../auth');
+
+// Short enough not to be theatre, long enough to matter. Deliberately not a
+// composition rule (uppercase + digit + symbol), which pushes people toward
+// "Password1!" and away from length.
+const MIN_PASSWORD_LENGTH = 8;
 
 // Job types an admin may queue from the API. Deliberately a whitelist: the queue is
 // an execution surface, and "run any registered type with any payload" is not a
 // thing an HTTP endpoint should offer.
-const QUEUEABLE_JOBS = new Set(['scan', 'extract']);
+const QUEUEABLE_JOBS = new Set(['scan', 'extract', 'sweep']);
 
 function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
   // Wrap a handler so it only runs with a live DB, and turn thrown {statusCode}
@@ -67,9 +72,22 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     ['POST', /^\/_api\/auth\/login$/, guarded(login)],
     ['POST', /^\/_api\/auth\/logout$/, guarded(logout)],
     ['GET', /^\/_api\/auth\/me$/, guarded(me)],
+    ['POST', /^\/_api\/auth\/password$/, guarded(changePassword)],
+    ['POST', /^\/_api\/auth\/mfa\/setup$/, guarded(mfaSetup)],
+    ['POST', /^\/_api\/auth\/mfa\/enable$/, guarded(mfaEnable)],
+    ['POST', /^\/_api\/auth\/mfa\/disable$/, guarded(mfaDisable)],
+    ['POST', /^\/_api\/auth\/mfa\/recovery$/, guarded(mfaRegenerateRecovery)],
+    ['GET', /^\/_api\/tokens$/, guarded(listTokens)],
+    ['POST', /^\/_api\/tokens$/, guarded(createToken)],
+    ['DELETE', /^\/_api\/tokens\/(\d+)$/, guarded(deleteToken)],
     ['GET', /^\/_api\/users$/, guarded(listUsers)],
     ['POST', /^\/_api\/users$/, guarded(createUser)],
+    ['DELETE', /^\/_api\/users\/(\d+)$/, guarded(deleteUser)],
+    ['POST', /^\/_api\/users\/(\d+)\/status$/, guarded(setUserStatus)],
+    ['POST', /^\/_api\/users\/(\d+)\/password$/, guarded(adminResetPassword)],
+    ['POST', /^\/_api\/users\/(\d+)\/mfa\/reset$/, guarded(adminResetMfa)],
     ['POST', /^\/_api\/users\/(\d+)\/roles$/, guarded(addRole)],
+    ['DELETE', /^\/_api\/users\/(\d+)\/roles\/([a-z]+)$/, guarded(removeRole)],
     ['POST', /^\/_api\/users\/(\d+)\/quota$/, guarded(setQuota)],
     ['GET', /^\/_api\/files$/, guarded(listFiles)],
     ['GET', /^\/_api\/files\/duplicates$/, guarded(duplicates)],
@@ -101,21 +119,168 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     if (await auth.findUser(body.email) || await auth.findUser(body.username)) {
       throw httpErr(409, 'exists', 'Email or username already in use');
     }
+    checkPasswordStrength(body.password);
     const user = await auth.createUser(body);
-    const session = await auth.login(body.email, body.password, reqMeta(req));
+    const session = await auth.issueSession(user, reqMeta(req));
     await audit(req, 'register', null, user.id);
-    return sendJson(res, 201, { user: publicUser(user), token: session.token, roles: await auth.rolesOf(user.id) });
+    return sendJson(res, 201, { user: publicUser(user), token: session.token, roles: await auth.rolesOf(user.id) },
+      { 'Set-Cookie': sessionCookie(req, session.token) });
+  }
+
+  // The session cookie. `Secure` is decided per request (SECURE_COOKIES) rather than
+  // hardcoded: a cookie without it travels in the clear on a non-TLS deployment, and
+  // hardcoding it on would break every plain-HTTP dev server.
+  function sessionCookie(req, token) {
+    const secure = wantSecureCookie(req, config.secureCookies) ? '; Secure' : '';
+    return `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${config.sessionTtlDays * 86400}${secure}`;
   }
 
   async function login(req, res) {
     const body = await readJson(req);
     requireFields(body, ['login', 'password']);
-    const session = await auth.login(body.login, body.password, reqMeta(req));
-    if (!session) { await audit(req, 'login_failed', body.login); throw httpErr(401, 'bad_credentials', 'Invalid login or password'); }
+    const ip = clientIp(req);
+
+    // Throttling comes FIRST, before any password work: an unthrottled login is an
+    // open invitation to grind, and scrypt makes each guess expensive for us too.
+    const lock = await auth.loginLockout(body.login, ip);
+    if (lock) {
+      await audit(req, 'login_locked', body.login);
+      const e = httpErr(429, 'too_many_attempts',
+        `Too many failed attempts (${lock.scope}). Try again in ${Math.ceil(lock.retryAfterSeconds / 60)} minute(s).`);
+      res.setHeader('Retry-After', String(lock.retryAfterSeconds));
+      throw e;
+    }
+
+    const session = await auth.login(body.login, body.password, { ...reqMeta(req), mfaCode: body.mfa_code || body.code });
+    if (!session) {
+      await auth.recordLoginAttempt(body.login, ip, false);
+      await audit(req, 'login_failed', body.login);
+      throw httpErr(401, 'bad_credentials', 'Invalid login or password');
+    }
+    // Password was right but a second factor is owed. Deliberately NOT counted as a
+    // failed attempt — the credential held, and locking someone out for fumbling a
+    // 30-second code is a denial of service against your own users.
+    if (session.mfaRequired) {
+      await audit(req, 'login_mfa_required', null, session.user.id);
+      throw httpErr(401, 'mfa_required', 'A multi-factor code is required');
+    }
+
+    await auth.recordLoginAttempt(body.login, ip, true);
+    await auth.clearLoginFailures(body.login, ip);
     await audit(req, 'login', null, session.user.id);
     const roles = await auth.rolesOf(session.user.id);
-    const cookie = `sid=${session.token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${config.sessionTtlDays * 86400}`;
-    return sendJson(res, 200, { user: publicUser(session.user), token: session.token, roles }, { 'Set-Cookie': cookie });
+    return sendJson(res, 200, { user: publicUser(session.user), token: session.token, roles },
+      { 'Set-Cookie': sessionCookie(req, session.token) });
+  }
+
+  // ── Self-service password & MFA ────────────────────────────────────────────
+  async function changePassword(req, res) {
+    const ctx = await requireAuth(req);
+    const body = await readJson(req);
+    requireFields(body, ['old_password', 'new_password']);
+    const { verifyPassword } = require('../auth');
+    if (!(await verifyPassword(String(body.old_password), ctx.user.password_hash))) {
+      throw httpErr(403, 'bad_password', 'Current password is incorrect');
+    }
+    checkPasswordStrength(body.new_password);
+    await auth.setPassword(ctx.user.id, String(body.new_password));
+    // Every OTHER session dies: a password change is usually a response to
+    // "someone may have my credentials", and leaving their sessions live defeats it.
+    const { bearerFrom } = require('../auth');
+    await auth.revokeSessions(ctx.user.id, { keepToken: bearerFrom(req) });
+    await audit(req, 'password_change', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, otherSessionsRevoked: true });
+  }
+
+  function requireMfaFeature() {
+    if (!config.mfaEnabled) throw httpErr(503, 'mfa_disabled', 'Multi-factor authentication is not enabled on this server');
+  }
+
+  // Step 1 of enrolment: mint a secret and hand back the otpauth:// URI to scan.
+  // Nothing is turned on yet — the secret is stored but `mfa_enabled` stays 0 until
+  // a working code proves the authenticator was actually set up.
+  async function mfaSetup(req, res) {
+    requireMfaFeature();
+    const ctx = await requireAuth(req);
+    const secret = totp.generateSecret();
+    await db.query('UPDATE users SET mfa_secret = ?, mfa_enabled = 0 WHERE id = ?', [secret, ctx.user.id]);
+    return sendJson(res, 200, {
+      secret,
+      otpauth_url: totp.otpauthUrl({ secret, account: ctx.user.email || ctx.user.username, issuer: config.mfaIssuer }),
+      issuer: config.mfaIssuer,
+    });
+  }
+
+  // Step 2: a correct code enables MFA and issues the recovery codes — shown once.
+  async function mfaEnable(req, res) {
+    requireMfaFeature();
+    const ctx = await requireAuth(req);
+    const body = await readJson(req);
+    requireFields(body, ['code']);
+    const fresh = await auth.findUser(ctx.user.id);
+    if (!fresh || !fresh.mfa_secret) throw httpErr(409, 'no_pending_setup', 'Start with POST /_api/auth/mfa/setup');
+    if (!totp.verify(fresh.mfa_secret, String(body.code))) throw httpErr(400, 'bad_code', 'That code is not valid');
+    await db.query('UPDATE users SET mfa_enabled = 1 WHERE id = ?', [ctx.user.id]);
+    const recovery = await auth.resetRecoveryCodes(ctx.user.id);
+    await audit(req, 'mfa_enable', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, recovery_codes: recovery, note: 'Store these now — they are not shown again.' });
+  }
+
+  async function mfaDisable(req, res) {
+    requireMfaFeature();
+    const ctx = await requireAuth(req);
+    const body = await readJson(req);
+    requireFields(body, ['password']);
+    const { verifyPassword } = require('../auth');
+    if (!(await verifyPassword(String(body.password), ctx.user.password_hash))) throw httpErr(403, 'bad_password', 'Password is incorrect');
+    await auth.disableMfa(ctx.user.id);
+    await audit(req, 'mfa_disable', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  async function mfaRegenerateRecovery(req, res) {
+    requireMfaFeature();
+    const ctx = await requireAuth(req);
+    const body = await readJson(req);
+    requireFields(body, ['password']);
+    const { verifyPassword } = require('../auth');
+    if (!(await verifyPassword(String(body.password), ctx.user.password_hash))) throw httpErr(403, 'bad_password', 'Password is incorrect');
+    const fresh = await auth.findUser(ctx.user.id);
+    if (!fresh || !fresh.mfa_enabled) throw httpErr(409, 'mfa_not_enabled', 'MFA is not enabled for this account');
+    const recovery = await auth.resetRecoveryCodes(ctx.user.id);
+    await audit(req, 'mfa_recovery_reset', null, ctx.user.id);
+    return sendJson(res, 200, { recovery_codes: recovery });
+  }
+
+  // ── API tokens ─────────────────────────────────────────────────────────────
+  async function listTokens(req, res) {
+    const ctx = await requireAuth(req);
+    const rows = await auth.listApiTokens(ctx.user.id);
+    return sendJson(res, 200, { tokens: rows.map((r) => ({ ...r, expired: !!r.expired })) });
+  }
+
+  async function createToken(req, res) {
+    const ctx = await requireAuth(req);
+    const body = await readJson(req);
+    requireFields(body, ['name']);
+    const t = await auth.createApiToken(ctx.user.id, {
+      name: String(body.name), expiresInDays: body.expires_in_days, scopes: body.scopes || null,
+    });
+    await audit(req, 'token_create', null, ctx.user.id);
+    // The plaintext appears here and never again — same discipline as a session token.
+    return sendJson(res, 201, {
+      token: t.token,
+      api_token: { id: t.id, name: t.name, expires_at: t.expires_at, scopes: t.scopes },
+      note: 'Copy this token now — it is not stored in plaintext and cannot be shown again.',
+    });
+  }
+
+  async function deleteToken(req, res, { params }) {
+    const ctx = await requireAuth(req);
+    const ok = await auth.deleteApiToken(ctx.user.id, Number(params[0]), { any: hasRole(ctx, 'admin') });
+    if (!ok) throw httpErr(404, 'not_found', 'Token not found');
+    await audit(req, 'token_delete', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true });
   }
 
   async function logout(req, res) {
@@ -130,6 +295,11 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     return sendJson(res, 200, {
       user: publicUser(ctx.user), roles: ctx.roles,
       storage: { usedBytes: usage, quotaBytes: ctx.user.storage_quota_bytes != null ? Number(ctx.user.storage_quota_bytes) : null },
+      mfa: {
+        available: !!config.mfaEnabled,
+        enabled: !!ctx.user.mfa_enabled,
+        recoveryCodesRemaining: ctx.user.mfa_enabled ? await auth.countRecoveryCodes(ctx.user.id) : 0,
+      },
     });
   }
 
@@ -153,6 +323,7 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     await requireAdmin(req);
     const body = await readJson(req);
     requireFields(body, ['email', 'username', 'password']);
+    checkPasswordStrength(body.password);
     if (await auth.findUser(body.email) || await auth.findUser(body.username)) throw httpErr(409, 'exists', 'Email or username already in use');
     const user = await auth.createUser(body);
     if (body.storage_quota_bytes != null && body.storage_quota_bytes !== '') {
@@ -163,11 +334,116 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
   }
 
   async function addRole(req, res, { params }) {
-    await requireAdmin(req);
+    const ctx = await requireAdmin(req);
     const body = await readJson(req);
     requireFields(body, ['role']);
     const ok = await auth.assignRole(Number(params[0]), body.role);
     if (!ok) throw httpErr(400, 'bad_role', 'Unknown role');
+    await audit(req, 'role_grant', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  /**
+   * Revoke a role. The route table could grant roles and never take one back, so a
+   * mis-click promoting someone to admin was permanent.
+   *
+   * Guarded against removing the last admin — an installation with no admin cannot
+   * create one, and the only way back is direct SQL.
+   */
+  async function removeRole(req, res, { params }) {
+    const ctx = await requireAdmin(req);
+    const userId = Number(params[0]);
+    const role = String(params[1]);
+    if (role === 'admin') await assertNotLastAdmin(userId, 'revoke the admin role from');
+    const ok = await auth.revokeRole(userId, role);
+    if (!ok) throw httpErr(404, 'not_found', 'User does not have that role');
+    // A revoked role must stop applying now, not whenever the token happens to expire.
+    await auth.revokeSessions(userId);
+    await audit(req, 'role_revoke', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, sessionsRevoked: true });
+  }
+
+  // Refuse an operation that would leave the system with no active admin.
+  async function assertNotLastAdmin(userId, what) {
+    const target = await auth.findUser(userId);
+    if (!target) throw httpErr(404, 'not_found', 'User not found');
+    const roles = await auth.rolesOf(userId);
+    if (!roles.includes('admin')) return;
+    const others = await auth.countAdmins({ excludeUserId: userId });
+    if (others === 0) throw httpErr(409, 'last_admin', `Refusing to ${what} the last remaining admin`);
+  }
+
+  async function setUserStatus(req, res, { params }) {
+    const ctx = await requireAdmin(req);
+    const body = await readJson(req);
+    requireFields(body, ['status']);
+    const userId = Number(params[0]);
+    const status = String(body.status);
+    if (!['active', 'disabled'].includes(status)) throw httpErr(400, 'bad_status', 'status must be active or disabled');
+    if (status === 'disabled') {
+      if (userId === ctx.user.id) throw httpErr(409, 'self_disable', 'Refusing to disable your own account');
+      await assertNotLastAdmin(userId, 'disable');
+    }
+    if (!(await auth.findUser(userId))) throw httpErr(404, 'not_found', 'User not found');
+    await auth.setStatus(userId, status);
+    await audit(req, status === 'disabled' ? 'user_disable' : 'user_enable', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, status });
+  }
+
+  /**
+   * Delete a user.
+   *
+   * What happens to the files they own is a real decision, not a detail: the rows
+   * carry tags, shares and quota accounting. `?files=orphan` (the default) clears the
+   * owner and keeps everything; `?files=reassign&to=<id>` transfers ownership, which
+   * also transfers the bytes against the new owner's quota. The masters themselves
+   * are never touched either way — deleting an account is not a way to delete data.
+   */
+  async function deleteUser(req, res, { params, url }) {
+    const ctx = await requireAdmin(req);
+    const userId = Number(params[0]);
+    if (userId === ctx.user.id) throw httpErr(409, 'self_delete', 'Refusing to delete your own account');
+    await assertNotLastAdmin(userId, 'delete');
+    const target = await auth.findUser(userId);
+    if (!target) throw httpErr(404, 'not_found', 'User not found');
+
+    const mode = (url.searchParams.get('files') || 'orphan').toLowerCase();
+    if (mode === 'reassign') {
+      const to = Number(url.searchParams.get('to'));
+      if (!to || !(await auth.findUser(to))) throw httpErr(400, 'bad_reassign', 'files=reassign needs a valid ?to=<userId>');
+      await db.query('UPDATE files SET owner_user_id = ? WHERE owner_user_id = ?', [to, userId]);
+    } else if (mode === 'orphan') {
+      await db.query('UPDATE files SET owner_user_id = NULL WHERE owner_user_id = ?', [userId]);
+    } else {
+      throw httpErr(400, 'bad_files_mode', 'files must be orphan or reassign');
+    }
+    // Sessions, tokens, roles and recovery codes go with the row (ON DELETE CASCADE);
+    // audit entries keep their user_id so the trail stays readable.
+    await db.query('DELETE FROM users WHERE id = ?', [userId]);
+    await audit(req, 'user_delete', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, files: mode });
+  }
+
+  async function adminResetPassword(req, res, { params }) {
+    const ctx = await requireAdmin(req);
+    const body = await readJson(req);
+    requireFields(body, ['new_password']);
+    checkPasswordStrength(body.new_password);
+    const userId = Number(params[0]);
+    if (!(await auth.findUser(userId))) throw httpErr(404, 'not_found', 'User not found');
+    await auth.setPassword(userId, String(body.new_password));
+    await auth.revokeSessions(userId);
+    await audit(req, 'password_reset', null, ctx.user.id);
+    return sendJson(res, 200, { ok: true, sessionsRevoked: true });
+  }
+
+  // The way back in for a user who lost their authenticator AND their recovery codes.
+  async function adminResetMfa(req, res, { params }) {
+    const ctx = await requireAdmin(req);
+    const userId = Number(params[0]);
+    if (!(await auth.findUser(userId))) throw httpErr(404, 'not_found', 'User not found');
+    await auth.disableMfa(userId);
+    await audit(req, 'mfa_admin_reset', null, ctx.user.id);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -419,10 +695,13 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null }) {
     const type = String(body.type);
     if (!QUEUEABLE_JOBS.has(type)) throw httpErr(400, 'bad_type', `Not queueable via the API: ${type}`);
     const payload = body.payload && typeof body.payload === 'object' ? body.payload : {};
-    // One live scan at a time; extraction dedupes per path.
+    // One live scan at a time; extraction dedupes per path. A manually-triggered
+    // sweep gets no dedupe key so it never collides with the self-scheduled one.
     const dedupeKey = type === 'scan'
       ? `scan:${payload.volumeId || 'all'}`
-      : (payload.path ? `extract:${require('../util').pathKey(String(payload.path).replace(/^\/+/, ''))}` : null);
+      : type === 'extract' && payload.path
+        ? `extract:${require('../util').pathKey(String(payload.path).replace(/^\/+/, ''))}`
+        : null;
     const id = await requireJobs().enqueue(type, payload, { dedupeKey, priority: 4, createdBy: ctx.user.id });
     if (!id) throw httpErr(500, 'enqueue_failed', 'Could not queue the job');
     await audit(req, 'job_create', payload.path || null, ctx.user.id);
@@ -499,6 +778,11 @@ function requireFields(body, fields) {
   for (const f of fields) if (body[f] == null || body[f] === '') throw httpErr(400, 'missing_field', `Missing field: ${f}`);
 }
 function publicUser(u) { return { id: u.id, email: u.email, username: u.username, display_name: u.display_name, status: u.status, mfa_enabled: !!u.mfa_enabled, created_at: u.created_at }; }
+function checkPasswordStrength(pw) {
+  if (String(pw).length < MIN_PASSWORD_LENGTH) {
+    throw httpErr(400, 'weak_password', `Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+  }
+}
 function reqMeta(req) { return { ip: clientIp(req), userAgent: req.headers['user-agent'] || '' }; }
 function shareUrl(req, token) {
   const proto = (req.headers['x-forwarded-proto'] || '').split(',')[0].trim() || 'http';

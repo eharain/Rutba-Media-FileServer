@@ -91,6 +91,36 @@ const STATEMENTS = [
      CONSTRAINT fk_api_tokens_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 
+  // One-time MFA recovery codes. Stored hashed, exactly like every other credential
+  // here, and consumed on use rather than deleted so an audit still shows it was spent.
+  `CREATE TABLE IF NOT EXISTS mfa_recovery_codes (
+     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     user_id    BIGINT UNSIGNED NOT NULL,
+     code_hash  CHAR(64) NOT NULL,
+     used_at    DATETIME NULL,
+     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     UNIQUE KEY uq_mfa_codes (user_id, code_hash),
+     KEY idx_mfa_codes_user (user_id),
+     CONSTRAINT fk_mfa_codes_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+  // Failed-login accounting. `audit_log` records that a login failed, but it is an
+  // append-only trail with no index shaped for "how many failures for this account
+  // in the last N minutes" — asking that question of it on every login would scan.
+  // This table is small, self-pruning (the sweep job) and indexed for exactly that.
+  `CREATE TABLE IF NOT EXISTS login_attempts (
+     id         BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+     login      VARCHAR(255) NULL,
+     ip         VARCHAR(64) NULL,
+     ok         TINYINT(1) NOT NULL DEFAULT 0,
+     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     PRIMARY KEY (id),
+     KEY idx_login_attempts_login (login, created_at),
+     KEY idx_login_attempts_ip (ip, created_at),
+     KEY idx_login_attempts_created (created_at)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
   // ── Content metadata ───────────────────────────────────────────────────────
   `CREATE TABLE IF NOT EXISTS folders (
      id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

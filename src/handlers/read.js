@@ -18,10 +18,15 @@ const path = require('path');
 const { relOf, clampInt } = require('../util');
 const { send, streamFile } = require('../http');
 const { MIME, RASTER, FMT_EXT } = require('../constants');
+const { isPrivateRel, readSidecar } = require('../visibility');
 
 const FIT_VALUES = ['cover', 'contain', 'inside', 'outside', 'fill'];
 
-function createReadHandler({ config, resizer, sharp, resolveMaster, media = null }) {
+// A fully-open guard, so the handler needs no null checks when READ_AUTH_MODE is
+// unset — which is the default, and must stay free.
+const OPEN_GUARD = { enabled: false, checksBeforeResolve: false, async deny() { return null; } };
+
+function createReadHandler({ config, resizer, sharp, resolveMaster, media = null, readGuard = OPEN_GUARD }) {
   // Parse resize options from the query string, clamped to safe ranges.
   function parseOpts(req, q) {
     const wq = clampInt(q.get('w'), 0, 1, config.maxDim);
@@ -47,12 +52,28 @@ function createReadHandler({ config, resizer, sharp, resolveMaster, media = null
     const posterReq = q.has('poster') || q.has('thumb');
     const transcodeReq = q.get('transcode') || q.get('mp4');
 
+    // READ_AUTH_MODE=private refuses everything up front — no point resolving (or,
+    // worse, pulling from an origin) for a caller who may not read anything at all.
+    if (readGuard.checksBeforeResolve) {
+      const refusal = await readGuard.deny(req, 'private');
+      if (refusal) return send(res, refusal.status, refusal.message);
+    }
+
     // resolveMaster may set opts.w (variant width) when a Strapi prefix matched.
     const r = await resolveMaster(reqRel, opts);
     if (r.forbidden) return send(res, 403, 'Forbidden');
     if (!r.masterPath || !r.stat) return send(res, 404, 'Not Found');
     const { masterPath, stat } = r;
     const rel = r.rel || relOf(config.masterDir, masterPath);
+
+    // READ_AUTH_MODE=mixed gates only private masters, so it needs the resolved
+    // file's actual visibility: an explicit per-file sidecar if one exists, else the
+    // path rule. (A sidecar read is one stat-ish syscall and only happens in `mixed`.)
+    if (readGuard.enabled && !readGuard.checksBeforeResolve) {
+      const visibility = (await readSidecar(masterPath)) || (isPrivateRel(rel, config.privatePaths) ? 'private' : 'public');
+      const refusal = await readGuard.deny(req, visibility);
+      if (refusal) return send(res, refusal.status, refusal.message);
+    }
 
     const ext = path.extname(masterPath).toLowerCase();
     const mime = MIME[ext] || 'application/octet-stream';
