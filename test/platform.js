@@ -1171,6 +1171,135 @@ async function bootstrapAdmin(base) {
       assert.equal((await fileRow('gallery/blue.jpg')).status, 'active');
     });
 
+    // ── video control plane (/_api/videos) ────────────────────────────────────
+    // The surface the ERP's gallery proxies. Its distinguishing property is the
+    // caller: a machine holding the UPLOAD_TOKEN and no account here at all, which
+    // is why every check below states which credential it used.
+    {
+      // Real MP4 bytes when ffmpeg could make them (so ffprobe has something to
+      // extract), otherwise a placeholder — the MIME comes from the extension, so
+      // listing and folder aggregation are exercised either way.
+      // Uploaded with the UPLOAD_TOKEN — unmetered, and the same credential the ERP
+      // writes with, so the fixture does not depend on any user's quota state.
+      const clip = video || Buffer.from('placeholder bytes, indexed as video/mp4 by extension');
+      await put('vid/2026/one.mp4', clip);
+      await put('vid/2026/two.mp4', clip);
+      await put('vid/old/three.mp4', clip);
+
+      await t('videos: the upload token alone is a valid caller (the ERP holds no account)', async () => {
+        assert.equal((await api('/_api/videos', { token: TOKEN })).status, 200, 'Authorization: Bearer <upload token>');
+        assert.equal((await api('/_api/videos', { headers: { 'X-Upload-Token': TOKEN } })).status, 200, 'X-Upload-Token fallback');
+      });
+
+      await t('videos: an anonymous caller is refused, a wrong token too', async () => {
+        assert.equal((await api('/_api/videos')).status, 401);
+        assert.equal((await api('/_api/videos/folders')).status, 401);
+        assert.equal((await api('/_api/videos', { token: 'x'.repeat(TOKEN.length) })).status, 401, 'same length, still refused');
+      });
+
+      await t('videos: only active video masters are listed, never images', async () => {
+        const r = await api('/_api/videos?limit=500', { token: TOKEN });
+        assert.equal(r.status, 200);
+        assert.ok(r.body.videos.length >= 3);
+        assert.ok(r.body.videos.every((v) => /^video\//.test(v.mime)), 'every row is video/*');
+        assert.ok(r.body.videos.every((v) => v.status === 'active'));
+        assert.ok(!r.body.videos.some((v) => v.path === 'gallery/blue.jpg'), 'images are not videos');
+      });
+
+      await t('videos: folder scoping — recursive=0 is immediate children, 1 is the subtree', async () => {
+        const direct = await api('/_api/videos?folder=vid&limit=500', { token: TOKEN });
+        assert.equal(direct.body.total, 0, 'vid/ holds no clips directly, only subfolders');
+        const deep = await api('/_api/videos?folder=vid&recursive=1&limit=500', { token: TOKEN });
+        assert.equal(deep.body.total, 3);
+        const leaf = await api('/_api/videos?folder=vid/2026&limit=500', { token: TOKEN });
+        assert.equal(leaf.body.total, 2);
+        assert.ok(leaf.body.videos.every((v) => v.folder === 'vid/2026'));
+      });
+
+      await t('videos: q searches, sort is whitelisted, limit/offset page', async () => {
+        assert.equal((await api('/_api/videos?q=three', { token: TOKEN })).body.total, 1);
+        const byName = await api('/_api/videos?folder=vid&recursive=1&sort=name', { token: TOKEN });
+        assert.deepEqual(byName.body.videos.map((v) => v.name), ['one.mp4', 'three.mp4', 'two.mp4']);
+        const page = await api('/_api/videos?folder=vid&recursive=1&sort=name&limit=1&offset=2', { token: TOKEN });
+        assert.equal(page.body.videos.length, 1);
+        assert.equal(page.body.videos[0].name, 'two.mp4');
+        assert.equal(page.body.total, 3, 'total counts the filter, not the page');
+        // Junk in `sort` must fall back, never reach the SQL.
+        assert.equal((await api('/_api/videos?sort=id;DROP', { token: TOKEN })).status, 200);
+      });
+
+      await t('videos: each entry carries folder, url and (with ffprobe) duration', async () => {
+        const r = await api('/_api/videos?q=one.mp4', { token: TOKEN });
+        const v = r.body.videos.find((x) => x.path === 'vid/2026/one.mp4');
+        assert.ok(v, 'the clip is listed');
+        assert.equal(v.folder, 'vid/2026');
+        assert.equal(v.url, '/vid/2026/one.mp4', 'path-relative — the caller composes the origin');
+        assert.equal((await fetch(BASE + v.url)).status, 200, 'and that url actually serves the master');
+        if (video) {
+          // Extraction is a queued job, so give it a moment to land.
+          const ok = await waitFor(async () =>
+            Number((await api('/_api/videos?q=one.mp4', { token: TOKEN })).body.videos[0].duration) >= 1);
+          assert.ok(ok, 'duration is read out of file_metadata.raw (there is no duration column)');
+        }
+      });
+
+      await t('videos/folders: ancestors aggregate everything beneath them', async () => {
+        const r = await api('/_api/videos/folders', { token: TOKEN });
+        assert.equal(r.status, 200);
+        const at = (p) => r.body.folders.find((f) => f.path === p);
+        assert.equal(at('vid').videos, 3, 'the ancestor counts both subfolders');
+        assert.equal(at('vid').parent, null);
+        assert.equal(at('vid/2026').videos, 2);
+        assert.equal(at('vid/2026').parent, 'vid');
+        assert.equal(at('vid/2026').name, '2026');
+        assert.equal(at('vid').bytes, at('vid/2026').bytes + at('vid/old').bytes);
+        assert.equal(r.body.total, r.body.folders.length);
+      });
+
+      await t('videos/scan: the token queues the EXISTING scan job, and a live scan is not duplicated', async () => {
+        const r = await api('/_api/videos/scan', { method: 'POST', token: TOKEN, json: { folder: '/vid/' } });
+        assert.equal(r.status, 202);
+        assert.equal(r.body.queued, true);
+        assert.equal(r.body.job.type, 'scan', 'the registered scan job, not a second scanner');
+        const queued = await api(`/_api/jobs/${r.body.job.id}`, { token: adminTok });
+        assert.equal(queued.body.job.payload.folder, 'vid', 'folder is normalized onto the payload');
+
+        const again = await api('/_api/videos/scan', { method: 'POST', token: TOKEN, json: {} });
+        assert.equal(again.status, 202);
+        // Same dedupe key the boot scan uses: while one is live, asking again hands
+        // back THAT job. (If the first already finished, a fresh one is correct — the
+        // property is "never two live scans", not "always the same id".)
+        const firstState = (await api(`/_api/jobs/${r.body.job.id}`, { token: adminTok })).body.job.state;
+        assert.ok(again.body.job.id === r.body.job.id || ['done', 'failed', 'cancelled'].includes(firstState),
+          `a live scan must be reused, not duplicated (first=${firstState}, second=${again.body.job.id})`);
+
+        // Let the pass finish so a real disk walk cannot race the tests that follow.
+        for (const id of new Set([r.body.job.id, again.body.job.id])) {
+          const done = await waitJob(id);
+          assert.equal(done.state, 'done', `scan error: ${done.error}`);
+        }
+      });
+
+      await t('videos/scan: a viewer may read the status but not trigger one', async () => {
+        assert.equal((await api('/_api/videos/scan', { token: viewerTok })).status, 200);
+        assert.equal((await api('/_api/videos/scan', { method: 'POST', token: viewerTok })).status, 403);
+        assert.equal((await api('/_api/videos/scan', { method: 'POST' })).status, 401);
+        const admin = await api('/_api/videos/scan', { method: 'POST', token: adminTok });
+        assert.equal(admin.status, 202);
+        await waitJob(admin.body.job.id);
+      });
+
+      await t('videos/scan: GET reports the job and the library totals', async () => {
+        const r = await api('/_api/videos/scan', { token: TOKEN });
+        assert.equal(r.status, 200);
+        assert.ok(r.body.job && r.body.job.type === 'scan', 'the most recent scan job');
+        assert.ok(['queued', 'running', 'done', 'failed', 'cancelled'].includes(r.body.job.state));
+        assert.ok(r.body.videos >= 3, 'active video count');
+        assert.ok(r.body.bytes > 0);
+        assert.ok('lastCompletedAt' in r.body);
+      });
+    }
+
     // ── AI enrichment: off by default ─────────────────────────────────────────
     // The main node has no ANTHROPIC_API_KEY, which is the shipping default. The
     // whole layer must be absent, not merely idle.

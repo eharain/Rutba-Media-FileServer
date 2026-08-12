@@ -55,11 +55,28 @@ function buildFileFilter(get) {
   }
 
   // Folder scope: the prefix, plus everything under it.
+  //
+  // `folder_mode=direct` narrows that to the folder's IMMEDIATE children — what a
+  // folder-by-folder browser lists, as opposed to the whole subtree a bulk action
+  // wants. Absent (or `under`) keeps the original subtree meaning, so every existing
+  // caller is untouched.
+  //
+  // The prefix is escaped before it goes into LIKE. `q` is a search, where a loose
+  // match is merely generous, but a folder is STRUCTURE: unescaped, a directory
+  // called `my_videos` also matches `myXvideos/...`, and this same clause decides
+  // which files a bulk tag or delete touches. The escape character is declared
+  // explicitly rather than relying on the backslash default, which `sql_mode`
+  // NO_BACKSLASH_ESCAPES turns off.
   const folder = val('folder');
   if (folder) {
-    const clean = folder.replace(/^\/+|\/+$/g, '');
-    where.push('(path LIKE ? )');
-    args.push(`${clean}/%`);
+    const clean = likePrefix(folder.replace(/^\/+|\/+$/g, ''));
+    if ((val('folder_mode') || 'under') === 'direct') {
+      where.push("(path LIKE ? ESCAPE '!' AND path NOT LIKE ? ESCAPE '!')");
+      args.push(`${clean}/%`, `${clean}/%/%`);
+    } else {
+      where.push("(path LIKE ? ESCAPE '!')");
+      args.push(`${clean}/%`);
+    }
   }
 
   const volume = val('volume');
@@ -99,8 +116,15 @@ function buildFileFilter(get) {
   return { clause: where.length ? 'WHERE ' + where.join(' AND ') : '', args };
 }
 
+// Neutralize the LIKE wildcards in a literal prefix. `!` is the escape character
+// declared by the clauses above; it must be escaped first or it would escape the
+// escapes this function just added.
+function likePrefix(s) {
+  return String(s).replace(/!/g, '!!').replace(/%/g, '!%').replace(/_/g, '!_');
+}
+
 // Convenience wrappers for the two shapes callers actually have.
 const fromSearchParams = (params) => buildFileFilter((k) => params.get(k));
 const fromObject = (obj) => buildFileFilter((k) => (obj && obj[k] != null ? obj[k] : null));
 
-module.exports = { buildFileFilter, fromSearchParams, fromObject };
+module.exports = { buildFileFilter, fromSearchParams, fromObject, likePrefix };

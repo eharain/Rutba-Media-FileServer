@@ -164,7 +164,8 @@ src/             # the media service, split for reuse/testing:
   ffmpeg.js      #   optional ffmpeg/ffprobe loader (bundled static binaries or PATH)
   mediavariant.js#   video poster frames + on-demand transcodes, cached like variants
   handlers/      #   read.js (GET/HEAD), write.js (PUT/DELETE, auth + replication),
-                 #   api.js (/_api), ui.js (/_ui), share.js (/_s), webdav.js (/_dav)
+                 #   api.js (/_api), ui.js (/_ui), share.js (/_s), webdav.js (/_dav),
+                 #   videos.js (/_api/videos — video listing/folders/scan for the ERP)
   app.js         #   createApp(config) → { server, cache } (routing + wiring)
 package.json     # deps: sharp, mysql2, exif-reader, ffmpeg-static, ffprobe-static
 web/             # web console SPA (index.html + app.js + styles.css, no build step)
@@ -187,8 +188,9 @@ nextjs/          # optional <Image> loader
 ```bash
 npm install            # installs sharp at the repo root (the server needs it)
 npm test               # origin suite — no database; proves the gated layers stay off
+npm run test:videos    # /_api/videos control plane — stubbed services, no MySQL, no server
 npm run test:platform  # platform suite — needs MySQL (see below)
-npm run test:all       # both
+npm run test:all       # all three
 ```
 Each suite prints its own check total, so no comment, README line or CI step can
 drift from the real number.

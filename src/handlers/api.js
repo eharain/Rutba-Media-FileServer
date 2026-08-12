@@ -22,6 +22,10 @@
  *   GET  /_api/jobs/:id        (admin)                                    → {job}
  *   POST /_api/jobs/:id/cancel (admin)                                    → {ok}
  *   POST /_api/jobs/:id/retry  (admin)                                    → {ok,job}
+ *   GET  /_api/videos          (token|user)  ?folder=&recursive=&q=&sort= → {videos,total,limit,offset}
+ *   GET  /_api/videos/folders  (token|user)                               → {folders,total}
+ *   POST /_api/videos/scan     (token|admin) {folder?}                    → 202 {queued,job}
+ *   GET  /_api/videos/scan     (token|user)                               → {job,videos,bytes,lastCompletedAt}
  *
  * The register route allows the FIRST account unconditionally (bootstrap admin);
  * further self-registration needs config.allowRegistration, else an admin creates
@@ -32,6 +36,7 @@ const crypto = require('crypto');
 const { sendJson, readJson, clientIp, wantSecureCookie, streamFile } = require('../http');
 const { hasRole, hashPassword, mysqlDate, totp } = require('../auth');
 const { createAssetRoutes } = require('./assets');
+const { createVideoRoutes } = require('./videos');
 const { buildFileFilter } = require('./filequery');
 
 // Short enough not to be theatre, long enough to matter. Deliberately not a
@@ -127,6 +132,15 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null, versi
       purgeCache: (rel) => (cache ? cache.purgeForPath(rel) : Promise.resolve()),
       // An edited rendition must take effect now, not when its 30s cache expires.
       invalidateRenditions: () => renditions && renditions.invalidate(),
+    }),
+    // Video control surface. Same namespace and dispatcher, but its OWN auth rule:
+    // these are called by the ERP, a machine that holds the upload token and no user
+    // account (see handlers/videos.js). `auth` is handed over whole because the
+    // module decides per route whether a token or a user is enough.
+    ...createVideoRoutes({
+      config, db, jobs, auth,
+      guarded, httpErr, clampInt, sendJson, readJson, audit,
+      isAdmin: (c) => hasRole(c, 'admin'),
     }),
   ];
 

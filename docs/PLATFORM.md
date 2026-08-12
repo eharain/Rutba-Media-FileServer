@@ -174,8 +174,14 @@ namespace never collides with media paths (like `/_health`).
 | `GET  /_api/files/ai?path=` | bearer | AI output for one asset, with its suggested tags |
 | `POST /_api/files/ai/review` | editor | `promote_tags` / `reject_tags` / `edit` / `reject` |
 | `GET  /_api/ai/usage` | admin | Token and dollar accounting, by day and by kind |
+| `GET  /_api/videos` | token² or any user | Indexed videos: `?folder=&recursive=&q=&sort=&limit=&offset=` |
+| `GET  /_api/videos/folders` | token² or any user | Every folder holding video, with counts and bytes |
+| `POST /_api/videos/scan` | token² or admin | Queue a drive scan `{folder?}` → `202 {queued, job}` |
+| `GET  /_api/videos/scan` | token² or any user | The live/last scan job + library totals |
 
 ¹ First account always allowed; subsequent self-registration needs `ALLOW_REGISTRATION=true`.
+² `UPLOAD_TOKEN`, as `Authorization: Bearer <token>` or `X-Upload-Token` — see
+[the video control plane](#video-control-plane-_apivideos).
 
 ## The index, and the scan that completes it
 
@@ -214,6 +220,64 @@ the next scan flips it back to `active`. List them with `/_api/files?status=miss
 Scans are **resumable** (a killed scan continues from its recorded progress rather
 than starting over) and **rate-limited** (`SCAN_RATE_FILES_PER_SEC`) so reconciling a
 large library never starves live requests.
+
+## Video control plane (`/_api/videos`)
+
+The endpoints the Rutba ERP's video gallery proxies. This server is the system of
+record for the video bytes *and* for scanning the drives they live on; the ERP holds
+no copy of either and only asks.
+
+**Why its own namespace when `/_api/files?type=video/` already exists.** The caller is
+a machine. It has exactly one credential here — the `UPLOAD_TOKEN` it already writes
+masters with — and no user account, while `/_api/files` requires a platform session.
+So these four routes accept **either** the upload token (`Authorization: Bearer
+<UPLOAD_TOKEN>`, or `X-Upload-Token` where a front-end strips `Authorization`) **or**
+any authenticated user. The token is compared in constant time. Queuing a scan is an
+execution surface, so `POST /_api/videos/scan` needs the token or an **admin** — a
+signed-in viewer can read the listing but cannot start a disk walk.
+
+```bash
+curl -H "X-Upload-Token: $UPLOAD_TOKEN" \
+  'https://media.example.com/_api/videos?folder=weddings/2026&sort=newest&limit=50'
+```
+
+```jsonc
+{ "videos": [ {
+    "id": 412, "path": "weddings/2026/mehndi.mp4", "name": "mehndi.mp4", "ext": ".mp4",
+    "mime": "video/mp4", "size_bytes": 84213120,
+    "width": 1920, "height": 1080, "duration": 372.5,
+    "folder": "weddings/2026", "url": "/weddings/2026/mehndi.mp4",
+    "visibility": "public", "status": "active",
+    "created_at": "...", "updated_at": "..." } ],
+  "total": 17, "limit": 50, "offset": 0 }
+```
+
+- Only `status=active` masters whose `mime` is `video/*` are ever returned; neither is
+  overridable from the query string.
+- `folder` scopes the listing — `recursive=0` (default) is that folder's **immediate**
+  children, `recursive=1` is everything beneath it. **No folder means every video at
+  any depth**, so `recursive` only carries meaning alongside a folder.
+- `sort` is one of `newest` (default, by `created_at`), `oldest`, `name`, `size`;
+  anything else falls back to `newest`.
+- `duration` is in **seconds**, or `null`. There is no duration column — it is read out
+  of `file_metadata.raw`, where ffprobe's output lands (`durationSec`, with
+  `format.duration` / `streams[].duration` read as fallbacks). It is populated by the
+  `extract` job, so a freshly scanned file reports `null` until extraction runs.
+- `url` is **path-relative**. This server has no configured public base URL — it is
+  reachable on several — so the caller composes the origin it reached us on.
+- `GET /_api/videos/folders` returns every directory holding video, ancestors included,
+  each counting everything beneath it: `{path, name, parent, videos, bytes}`. Files at
+  a volume root belong to no folder and so appear in no row (their `folder` is `""`).
+
+`POST /_api/videos/scan` queues the **same** `scan` job described above — this is not a
+second scanner. It dedupes on `scan:all`, the key `SCAN_ON_BOOT` uses, so a scan
+already queued or running is handed back instead of a second walk of the disk starting
+behind it. `folder` is accepted and recorded on the job payload but does **not** narrow
+the walk: deciding a row is `missing` requires a complete pass over every volume.
+`GET /_api/videos/scan` answers "is it indexed yet?" — the live-or-last scan job, the
+active video count and bytes, and when a scan last completed. It reads the job row
+directly, so it still reports on a deployment where `JOBS_ENABLED=0` hands execution to
+a separate worker process.
 
 ## Read authorization (`READ_AUTH_MODE`)
 
