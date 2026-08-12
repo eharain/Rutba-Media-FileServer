@@ -17,8 +17,10 @@
  * drive has been re-scanned since someone dropped new files onto it.
  *
  * Routes:
- *   GET  /_api/videos          service|user   ?folder=&recursive=&q=&limit=&offset=&sort=
+ *   GET  /_api/videos          service|user   ?folder=&recursive=&q=&tag=&since=&until=
+ *                                             &limit=&offset=&sort=
  *   GET  /_api/videos/folders  service|user   every folder holding video, with totals
+ *   GET  /_api/videos/tags     service|user   tags that are actually ON video, w/ counts
  *   POST /_api/videos/scan     service|admin  queue the existing `scan` job → 202
  *   GET  /_api/videos/scan     service|user   the live/last scan job + library totals
  *
@@ -125,7 +127,14 @@ function createVideoRoutes(ctx) {
     await requireServiceOrAuth(req);
     const params = url.searchParams;
     const recursive = /^(1|true|yes|on)$/i.test(params.get('recursive') || '');
-    const { clause, args } = videoFilter({ q: params.get('q'), folder: params.get('folder'), recursive });
+    const { clause, args } = videoFilter({
+      q: params.get('q'),
+      folder: params.get('folder'),
+      recursive,
+      tag: params.get('tag'),
+      since: params.get('since'),
+      until: params.get('until'),
+    });
 
     const limit = clampInt(params.get('limit'), 50, 1, 500);
     const offset = clampInt(params.get('offset'), 0, 0, 1e9);
@@ -139,13 +148,33 @@ function createVideoRoutes(ctx) {
       `SELECT id, path, name, ext, mime, size_bytes, width, height, visibility, status, created_at, updated_at
          FROM files ${clause} ORDER BY ${order} LIMIT ${limit} OFFSET ${offset}`, args);
 
-    const meta = await metadataFor(rows.map((r) => r.id));
+    const ids = rows.map((r) => r.id);
+    const [meta, tags] = await Promise.all([metadataFor(ids), tagsFor(ids)]);
     return sendJson(res, 200, {
-      videos: rows.map((r) => shapeVideo(r, meta.get(Number(r.id)))),
+      videos: rows.map((r) => shapeVideo(r, meta.get(Number(r.id)), tags.get(Number(r.id)))),
       total: totalRow ? Number(totalRow.n) : rows.length,
       limit,
       offset,
     });
+  }
+
+  // Tags for one page of results, keyed by file id. Same shape and same reason as
+  // metadataFor: a JOIN would multiply the rows by their tag count and quietly
+  // break `total` and the page size.
+  async function tagsFor(ids) {
+    const out = new Map();
+    if (!ids.length) return out;
+    const holes = ids.map(() => '?').join(',');
+    const rows = await db.query(
+      `SELECT ft.file_id, t.name FROM file_tags ft JOIN tags t ON t.id = ft.tag_id
+        WHERE ft.file_id IN (${holes}) ORDER BY t.name`,
+      ids.map(Number));
+    for (const r of rows) {
+      const key = Number(r.file_id);
+      if (!out.has(key)) out.set(key, []);
+      out.get(key).push(r.name);
+    }
+    return out;
   }
 
   // Extracted metadata for one page of results, keyed by file id. A second query
@@ -179,6 +208,33 @@ function createVideoRoutes(ctx) {
     const rows = await db.query(`SELECT path, size_bytes FROM files ${clause}`, args);
     const folders = foldersFromPaths(rows);
     return sendJson(res, 200, { folders, total: folders.length });
+  }
+
+  // ── GET /_api/videos/tags ───────────────────────────────────────────────────
+  /**
+   * Tags that are actually on a video, with how many videos carry each.
+   *
+   * Deliberately not `GET /_api/tags`: that counts every file, so a gallery filter
+   * built on it offers tags that match no clip and shows counts the listing then
+   * contradicts. `?folder=` narrows it to the folder in view, which is what makes
+   * the filter a facet of what you are looking at rather than of the whole store.
+   */
+  async function listTags(req, res, { url }) {
+    await requireServiceOrAuth(req);
+    const params = url.searchParams;
+    const recursive = /^(1|true|yes|on)$/i.test(params.get('recursive') || '');
+    const { clause, args } = videoFilter({ folder: params.get('folder'), recursive });
+    const rows = await db.query(
+      `SELECT t.name, COUNT(*) AS n
+         FROM file_tags ft
+         JOIN tags t ON t.id = ft.tag_id
+        WHERE ft.file_id IN (SELECT id FROM files ${clause})
+        GROUP BY t.name
+        ORDER BY n DESC, t.name ASC`, args);
+    return sendJson(res, 200, {
+      tags: rows.map((r) => ({ name: r.name, count: Number(r.n) || 0 })),
+      total: rows.length,
+    });
   }
 
   // ── POST /_api/videos/scan ──────────────────────────────────────────────────
@@ -249,6 +305,7 @@ function createVideoRoutes(ctx) {
   return [
     ['GET', /^\/_api\/videos$/, guarded(listVideos)],
     ['GET', /^\/_api\/videos\/folders$/, guarded(listFolders)],
+    ['GET', /^\/_api\/videos\/tags$/, guarded(listTags)],
     ['POST', /^\/_api\/videos\/scan$/, guarded(triggerScan)],
     ['GET', /^\/_api\/videos\/scan$/, guarded(scanStatus)],
   ];
@@ -263,12 +320,15 @@ function createVideoRoutes(ctx) {
  * custom fields…) returns null and is therefore absent — one filter implementation,
  * a deliberately narrow door into it.
  */
-function videoFilter({ q = null, folder = null, recursive = false }) {
+function videoFilter({ q = null, folder = null, recursive = false, tag = null, since = null, until = null }) {
   return buildFileFilter((k) => {
     switch (k) {
       case 'status': return 'active';
       case 'type': return 'video/';                          // → mime LIKE 'video/%'
       case 'q': return q;
+      case 'tag': return tag;
+      case 'created_after': return since;
+      case 'created_before': return until;
       case 'folder': return folder;
       case 'folder_mode': return recursive ? 'under' : 'direct';
       default: return null;
@@ -324,10 +384,11 @@ function durationFromRaw(raw) {
 // Dimensions prefer the `files` columns (kept current by every write path) and fall
 // back to the extracted ones, so a row indexed by a scan before extraction ran still
 // reports what it can.
-function shapeVideo(row, meta) {
+function shapeVideo(row, meta, tags) {
   const width = firstNumber(row.width, meta && meta.width);
   const height = firstNumber(row.height, meta && meta.height);
   return {
+    tags: tags || [],
     id: Number(row.id),
     path: row.path,
     name: row.name,

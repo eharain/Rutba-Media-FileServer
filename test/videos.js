@@ -48,6 +48,14 @@ const METADATA = [
   // file 3 has no metadata row at all.
 ];
 
+// file 1 carries two tags, file 2 one, the rest none — so a page mixes tagged and
+// untagged clips, which is where a JOIN-based implementation would drop rows.
+const FILE_TAGS = [
+  { file_id: 1, name: 'b-roll' },
+  { file_id: 1, name: 'wedding' },
+  { file_id: 2, name: 'b-roll' },
+];
+
 function row(id, path, size, { width, height }) {
   return {
     id, path, name: path.slice(path.lastIndexOf('/') + 1), ext: path.slice(path.lastIndexOf('.')),
@@ -67,10 +75,14 @@ function makeDb({ enabled = true } = {}) {
   const query = async (sql, args = []) => {
     calls.push({ sql, args });
     if (/audit_log/.test(sql)) return { affectedRows: 1 };
+    // Before the generic COUNT branch below: the tag facet is itself a
+    // `COUNT(*) AS n … FROM files` (in its subquery) and would be swallowed by it.
+    if (/GROUP BY t\.name/.test(sql)) return [{ name: 'b-roll', n: 2 }, { name: 'wedding', n: 1 }];
     if (/SUM\(size_bytes\),0\) AS bytes/.test(sql)) return [{ n: VIDEOS.length, bytes: 4500 }];
     if (/COUNT\(\*\) AS n[\s\S]*FROM files/.test(sql)) return [{ n: VIDEOS.length }];
     if (/SELECT id, path, name, ext, mime/.test(sql)) return VIDEOS;
     if (/FROM file_metadata WHERE file_id IN/.test(sql)) return METADATA.filter((m) => args.includes(m.file_id));
+    if (/FROM file_tags ft/.test(sql)) return FILE_TAGS.filter((t) => args.includes(t.file_id));
     if (/SELECT path, size_bytes FROM files/.test(sql)) return VIDEOS.map((v) => ({ path: v.path, size_bytes: v.size_bytes }));
     if (/MAX\(finished_at\)/.test(sql)) return [{ at: '2026-08-02 09:00:00' }];
     if (/FROM jobs WHERE type = \?/.test(sql)) {
@@ -327,6 +339,51 @@ const t = runner.t.bind(runner);
     const { clause, args } = videoFilter({ q: "wed'ding", folder: 'clips', recursive: true });
     assert.deepEqual(args, ['active', "%wed'ding%", "%wed'ding%", 'video/%', 'clips/%']);
     for (const v of args) assert.ok(!clause.includes(v), `"${v}" leaked into the SQL text`);
+  });
+
+  await t('tag filters through the shared subquery, bound and never interpolated', () => {
+    const { clause, args } = videoFilter({ tag: "b-roll'; DROP" });
+    assert.ok(/file_tags/.test(clause) && /t\.name = \?/.test(clause));
+    assert.deepEqual(args, ['active', 'video/%', "b-roll'; DROP"]);
+    for (const v of args) assert.ok(!clause.includes(v), `"${v}" leaked into the SQL text`);
+  });
+
+  await t('the date window is created_at, so a re-tagged clip does not look new', () => {
+    const { clause, args } = videoFilter({ since: '2026-08-01 00:00:00', until: '2026-08-12 23:59:59' });
+    assert.ok(/created_at >= \?/.test(clause), 'lower bound is created_at');
+    assert.ok(/created_at <= \?/.test(clause), 'upper bound is created_at');
+    assert.ok(!/updated_at/.test(clause), 'updated_at must not answer an "uploaded between" question');
+    assert.deepEqual(args.slice(2), ['2026-08-01 00:00:00', '2026-08-12 23:59:59']);
+  });
+
+  await t('each listed clip carries its tags, and an untagged one carries []', async () => {
+    const { handler } = build();
+    const res = await call(handler, '/_api/videos', { headers: { 'x-upload-token': TOKEN } });
+    assert.equal(res.status, 200);
+    const byId = new Map(res.body.videos.map((v) => [v.id, v]));
+    assert.deepEqual(byId.get(1).tags, ['b-roll', 'wedding']);
+    assert.deepEqual(byId.get(2).tags, ['b-roll']);
+    assert.deepEqual(byId.get(3).tags, [], 'an untagged clip is [], never undefined');
+    // A JOIN would have multiplied file 1 by its two tags and broken the page.
+    assert.equal(res.body.videos.length, VIDEOS.length);
+  });
+
+  await t('the tag facet counts video only, and is scoped to the folder in view', async () => {
+    const { handler, db } = build();
+    const res = await call(handler, '/_api/videos/tags?folder=clips/2026&recursive=1',
+      { headers: { 'x-upload-token': TOKEN } });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.tags, [{ name: 'b-roll', count: 2 }, { name: 'wedding', count: 1 }]);
+    const q = db.calls.find((c) => /GROUP BY t\.name/.test(c.sql));
+    assert.ok(/FROM files WHERE/.test(q.sql.replace(/\s+/g, ' ')), 'counted over the video filter, not every file');
+    assert.ok(q.args.includes('video/%'), 'video-only');
+    assert.ok(q.args.includes('clips/2026/%'), 'folder-scoped');
+  });
+
+  await t('an anonymous caller cannot read the tag facet', async () => {
+    const { handler } = build();
+    const res = await call(handler, '/_api/videos/tags');
+    assert.equal(res.status, 401);
   });
 
   await t('limit/offset are clamped integers, never caller text', async () => {

@@ -96,6 +96,15 @@ function buildFileFilter(get) {
   const since = val('since');
   if (since) { where.push('updated_at >= ?'); args.push(since); }
 
+  // Upload-date window. Deliberately created_at, and deliberately NOT folded into
+  // `since` above: "changed since" and "uploaded between" are different questions,
+  // and a gallery asking the second must not be answered with the first — a file
+  // re-tagged today did not arrive today.
+  const createdAfter = val('created_after');
+  if (createdAfter) { where.push('created_at >= ?'); args.push(createdAfter); }
+  const createdBefore = val('created_before');
+  if (createdBefore) { where.push('created_at <= ?'); args.push(createdBefore); }
+
   // Custom metadata: `field:<key>=<value>`, exact match on the text projection every
   // value type also writes, so one syntax works for all of them.
   const fieldKey = val('field');
