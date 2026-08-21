@@ -3,8 +3,13 @@
   "version": "2.0.0",
   "private": true,
   "description": "Masters-only media origin with on-the-fly resize + LRU cache for images.rutba.pk (Hostinger Node.js hosting)",
+  "workspaces": [
+    "provider",
+    "migrate",
+    "test"
+  ],
   "main": "server.js",
-  "license": "MIT",
+  "license": "AGPL-3.0-or-later",
   "author": "Ejaz Arain <eharain@yahoo.com> (https://tech-style.co)",
   "homepage": "https://tech-style.co",
   "scripts": {

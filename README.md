@@ -271,5 +271,7 @@ curl -r 0-1023 -sD - -o /dev/null https://images.rutba.pk/<name>.mp4  # 206
 - Optionally disable Strapi's responsive-breakpoint generation so new uploads store the master only.
 
 ## License & ownership
-MIT-licensed. Copyright © 2026 Ejaz Arain — [tech-style.co](https://tech-style.co).
-Maintainer: Ejaz Arain &lt;eharain@yahoo.com&gt;. See [LICENSE](LICENSE).
+Dual-licensed under the GNU AGPL v3.0 (see [LICENSE](LICENSE)) and a
+separate commercial license — see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+Copyright (C) 2026 Tech Style Ltd — [tech-style.co](https://tech-style.co).
+Maintainer: Ejaz Arain &lt;eharain@yahoo.com&gt;. Commercial licensing: hello@tech-style.co.
