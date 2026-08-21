@@ -3,6 +3,8 @@
 A Node.js media origin for `images.rutba.pk` (reusable for `images.trustlist.uk`),
 built for **Hostinger Node.js hosting** (Business Web Hosting, `77.37.37.27`) or a VPS container.
 
+> This repo (formerly `Rutba-Media-FileServer`) now lives in the Rutba 2.0 workers tier as `workers/media` - see [rutba-workers](https://github.com/eharain/rutba-workers). It remains a standalone, self-contained product.
+
 > **Project layout** — full spec in `SPEC.md`; what's outstanding and in what order
 > in **[docs/ROADMAP.md](docs/ROADMAP.md)**.
 > - `server.js` / `package.json` — the media service (this README)
