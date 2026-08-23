@@ -1,15 +1,16 @@
 #!/bin/sh
 # Rejects any commit whose message contains an AI-bot co-authorship or
-# generated-by trailer (Claude, Copilot, ChatGPT, OpenAI/GPT, Anthropic).
+# generated-by trailer (Claude, Copilot, ChatGPT, OpenAI/GPT, Anthropic, Cursor, Codeium, Tabnine, Windsurf, Kimi, DeepSeek, Gemini, Codex).
+# Installed machine-wide via `git config --global core.hooksPath`.
 
 MSG_FILE="$1"
 
-if grep -qiE '^Co-Authored-By:.*(claude|anthropic|copilot|openai|chatgpt|gpt-[0-9])' "$MSG_FILE" \
-  || grep -qiE 'generated with.*(claude|copilot|chatgpt)' "$MSG_FILE" \
-  || grep -qE '^🤖' "$MSG_FILE"; then
+if grep -qiE '^Co-Authored-By:.*(claude|anthropic|copilot|openai|chatgpt|gpt-[0-9]|cursor|codeium|tabnine|windsurf|kimi|deepseek|gemini|codex)' "$MSG_FILE" \
+  || grep -qiE 'generated with.*(claude|copilot|chatgpt|cursor|codeium|tabnine|windsurf|kimi|deepseek|gemini|codex)' "$MSG_FILE" \
+  || grep -qE '^ðŸ¤–' "$MSG_FILE"; then
   echo "" >&2
-  echo "commit-msg hook: rejected — commit message contains an AI-bot attribution trailer." >&2
-  echo "Remove any 'Co-Authored-By: <AI bot>', '🤖 Generated with ...', or similar line and retry." >&2
+  echo "commit-msg hook: rejected â€” commit message contains an AI-bot attribution trailer." >&2
+  echo "Remove any 'Co-Authored-By: <AI bot>', 'ðŸ¤– Generated with ...', or similar line and retry." >&2
   echo "" >&2
   exit 1
 fi

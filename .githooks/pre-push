@@ -18,7 +18,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
 
   for c in $(git rev-list "$range" -- 2>/dev/null); do
-    hit=$(git show -s --format="%B" "$c" | grep -iE '^Co-Authored-By:.*(claude|anthropic|copilot|openai|chatgpt|gpt-[0-9])|generated with.*(claude|copilot|chatgpt)|^🤖')
+    hit=$(git show -s --format="%B" "$c" | grep -iE '^Co-Authored-By:.*(claude|anthropic|copilot|openai|chatgpt|gpt-[0-9]|cursor|codeium|tabnine|windsurf|kimi|deepseek|gemini|codex)|generated with.*(claude|copilot|chatgpt|cursor|codeium|tabnine|windsurf|kimi|deepseek|gemini|codex)|^ðŸ¤–')
     if [ -n "$hit" ]; then
       bad=1
       matches="$matches\n  $c ($remote_ref): $hit"
@@ -28,7 +28,7 @@ done
 
 if [ "$bad" -eq 1 ]; then
   echo "" >&2
-  echo "pre-push hook: rejected — commit(s) about to be pushed contain an AI-bot attribution trailer:" >&2
+  echo "pre-push hook: rejected â€” commit(s) about to be pushed contain an AI-bot attribution trailer:" >&2
   printf "%b\n" "$matches" >&2
   echo "" >&2
   exit 1
