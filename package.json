@@ -13,6 +13,7 @@
   "author": "Ejaz Arain <eharain@yahoo.com> (https://tech-style.co)",
   "homepage": "https://tech-style.co",
   "scripts": {
+    "prepare": "git config core.hooksPath .githooks",
     "start": "node server.js",
     "pretest": "npm --prefix test install --no-audit --no-fund",
     "test": "node test/test.js",
