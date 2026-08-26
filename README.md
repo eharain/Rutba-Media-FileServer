@@ -167,7 +167,7 @@ src/             # the media service, split for reuse/testing:
   mediavariant.js#   video poster frames + on-demand transcodes, cached like variants
   handlers/      #   read.js (GET/HEAD), write.js (PUT/DELETE, auth + replication),
                  #   api.js (/_api), ui.js (/_ui), share.js (/_s), webdav.js (/_dav),
-                 #   videos.js (/_api/videos — video listing/folders/scan for the ERP)
+                 #   videos.js (/_api/videos — video listing/folders/scan for the consumer apps)
   app.js         #   createApp(config) → { server, cache } (routing + wiring)
 package.json     # deps: sharp, mysql2, exif-reader, ffmpeg-static, ffprobe-static
 web/             # web console SPA (index.html + app.js + styles.css, no build step)
