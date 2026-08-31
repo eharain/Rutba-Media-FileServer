@@ -9,7 +9,7 @@ Two modes, one command each. **Origin-only** is the plain masters-only resize or
 no database, no console, no accounts:
 
 ```bash
-docker network create edge 2>/dev/null || true            # shared with the ERP Caddy
+docker network create edge 2>/dev/null || true            # shared with the suite's Caddy
 cd deploy
 MEDIA_UPLOAD_TOKEN='<strong-secret>' docker compose up -d --build
 ```

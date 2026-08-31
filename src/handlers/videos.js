@@ -1,11 +1,11 @@
 'use strict';
 
 /**
- * Video control surface under `/_api/videos` — the endpoints the ERP's video gallery
- * proxies.
+ * Video control surface under `/_api/videos` — the endpoints the suite's video
+ * gallery proxies.
  *
  * WHY a namespace of its own when `GET /_api/files?type=video/` already exists: the
- * ERP is a MACHINE caller. It holds exactly one credential for this server — the
+ * suite is a MACHINE caller. It holds exactly one credential for this server — the
  * UPLOAD_TOKEN it already writes masters with — and has no user account here.
  * `/_api/files` demands a platform session, so wiring the gallery to it would mean
  * minting a service user and rotating its password alongside everything else. These

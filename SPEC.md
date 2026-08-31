@@ -1,7 +1,7 @@
 # Rutba/TrustList Media File Server — Specification
 
 ## 1. Purpose & context
-Two Strapi-backed sites — **rutba.pk** (ERP) and **trustlist.uk** — store media bloated by
+Two Strapi-backed sites — **rutba.pk** (Rutba Suite) and **trustlist.uk** — store media bloated by
 Strapi's pre-generated responsive variants (`thumbnail_/small_/medium_/large_`): e.g. ~5.4k
 originals → ~30k files / 4.9 GB. trustlist additionally used **AWS S3**; rutba.pk uses the
 **local** Strapi provider.

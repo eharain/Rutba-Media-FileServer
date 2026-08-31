@@ -134,7 +134,7 @@ function createApiHandler({ config, db, auth, trash, storage, jobs = null, versi
       invalidateRenditions: () => renditions && renditions.invalidate(),
     }),
     // Video control surface. Same namespace and dispatcher, but its OWN auth rule:
-    // these are called by the ERP, a machine that holds the upload token and no user
+    // these are called by the suite, a machine that holds the upload token and no user
     // account (see handlers/videos.js). `auth` is handed over whole because the
     // module decides per route whether a token or a user is enough.
     ...createVideoRoutes({

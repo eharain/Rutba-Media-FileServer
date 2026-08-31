@@ -38,7 +38,7 @@ services:
       - media_masters:/data/masters
       - media_cache:/data/cache
       - media_trash:/data/trash
-      # To serve EXISTING ERP masters without migrating files, you may instead mount
+      # To serve EXISTING Strapi masters without migrating files, you may instead mount
       # the Strapi uploads volume read-only as the master dir (then only the DB needs
       # rewriting). NOTE: pre-existing files are invisible to the platform index until
       # a scan indexes them — run `POST /_api/jobs/scan` (or SCAN_ON_BOOT=1) after
