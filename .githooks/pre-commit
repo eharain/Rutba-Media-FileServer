@@ -17,7 +17,18 @@
 # RULES.md (and the .ai-rules.md predecessor). Anything else staged with a
 # match is rejected.
 
-PATTERN='claude|anthropic|copilot|chatgpt|openai|gpt-[0-9]|cursor|codeium|tabnine|windsurf|kimi|deepseek|gemini|codex'
+# Two classes, because one of them collides with ordinary code.
+#   AI_ANYWHERE — distinctive enough to be meant wherever it appears, so it
+#     matches inside an identifier too. Word-bounding these would let a
+#     camelCase file or symbol name through, which is a name worth catching.
+#   AI_WORD — also ordinary substrings, so they count only as WHOLE WORDS. An
+#     XML decoding helper whose name ends in "codeX" is not a tool, and neither
+#     is a meteor shower. Each still trips when written as a word.
+#
+# Added 2026-09-06, mirroring pre-push and commit-msg.
+AI_ANYWHERE='claude|anthropic|copilot|chatgpt|openai|gpt-[0-9]|codeium|tabnine|windsurf|deepseek'
+AI_WORD='codex|kimi|gemini'
+PATTERN="$AI_ANYWHERE|\\b($AI_WORD)\\b|cursor"
 
 # CONTENT is scanned with a second pattern, because one name on that list is
 # also an ordinary word.
@@ -37,7 +48,7 @@ PATTERN='claude|anthropic|copilot|chatgpt|openai|gpt-[0-9]|cursor|codeium|tabnin
 # `.cursor/` or `cursorrules` is exactly the artefact worth catching.
 #
 # Every other name on the list is unambiguous and stays broad.
-CONTENT_PATTERN='claude|anthropic|copilot|chatgpt|openai|gpt-[0-9]|codeium|tabnine|windsurf|kimi|deepseek|gemini|codex'
+CONTENT_PATTERN="$AI_ANYWHERE|\\b($AI_WORD)\\b"
 CURSOR_PATTERN='(co-?authored|generated|written|authored|created|assisted|made|built|powered)([^a-z]|[a-z]){0,24}cursor|cursor\.(sh|so|com|ai|dev)|cursor[-_ ](ide|editor|ai|agent|composer|rules)|\.cursorrules|\.cursor/'
 
 # ── who is committing ───────────────────────────────────────────────────────
