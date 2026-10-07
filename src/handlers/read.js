@@ -112,7 +112,12 @@ function createReadHandler({ config, resizer, sharp, resolveMaster, media = null
     const wantResize = (hasQuery || opts.w) && RASTER.has(ext) && sharp && ext !== '.svg';
     if (!wantResize) return streamFile(req, res, masterPath, mime, stat);
 
-    const v = await resizer.getVariant(masterPath, rel, stat, opts);
+    // A master sharp cannot read is sent as it is, rather than failing the request; the log names it.
+    const v = await resizer.getVariant(masterPath, rel, stat, opts).catch((err) => {
+      console.warn(`[media] resize failed, serving the master as is: ${rel} — ${err && err.message}`);
+      return null;
+    });
+    if (!v) return streamFile(req, res, masterPath, MIME[ext] || 'application/octet-stream', stat);
     const vstat = await fsp.stat(v.cachePath).catch(() => null);
     if (!vstat) return streamFile(req, res, masterPath, mime, stat);
     return streamFile(req, res, v.cachePath, MIME[v.ext] || 'image/jpeg', vstat);

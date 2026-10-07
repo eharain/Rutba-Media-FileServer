@@ -120,11 +120,16 @@ function createApp(config) {
 
       const reqRel = u.pathname.replace(/^\/+/, '');
 
-      if (req.method === 'PUT' || req.method === 'DELETE') return handleWrite(req, res, reqRel);
+      // Awaited, not just returned: a returned promise's rejection skips this try/catch, and in Node 18
+      // an unhandled rejection ends the process. One master sharp could not read ("unsupported image
+      // format") took the whole server down with every request in flight, 195 times by 2026-10-07,
+      // until LiteSpeed stopped routing to it and images.trustlist.uk answered nothing.
+      if (req.method === 'PUT' || req.method === 'DELETE') return void (await handleWrite(req, res, reqRel));
       if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method Not Allowed');
 
-      return handleRead(req, res, reqRel, u.searchParams);
+      return void (await handleRead(req, res, reqRel, u.searchParams));
     } catch (err) {
+      console.warn(`[media] request failed: ${req.method} ${req.url} — ${err && err.message}`);
       if (!res.headersSent) send(res, 500, 'Server Error'); else res.destroy();
     }
   });

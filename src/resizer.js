@@ -50,7 +50,7 @@ class VariantResizer {
       else if (fm === 'png') img = img.png({ compressionLevel: 9 });
       else if (fm === 'gif') img = img.gif();
       else img = img.jpeg({ quality: opts.q, mozjpeg: true });
-      await img.toFile(tmp);
+      await img.toFile(tmp).catch(async (err) => { await fsp.unlink(tmp).catch(() => {}); throw err; });
       const st = await fsp.stat(tmp);
       await fsp.rename(tmp, cachePath);
       cache.add(name, st.size);
