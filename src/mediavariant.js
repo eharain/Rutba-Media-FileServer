@@ -30,7 +30,7 @@ class MediaVariant {
   async _produce(name, make) {
     const { cache } = this;
     const cachePath = cache.pathFor(name);
-    if (cache.has(name)) { cache.touch(name); return cachePath; }
+    if (cache.has(name) || await cache.onDisk(name)) { cache.touch(name); return cachePath; }
     if (this.inflight.has(name)) { await this.inflight.get(name); return cachePath; }
     const p = (async () => {
       const tmp = cachePath + '.' + process.pid + '.tmp';

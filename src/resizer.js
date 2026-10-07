@@ -36,7 +36,7 @@ class VariantResizer {
     const { name, ext } = this.cacheNameFor(masterPath, masterRel, masterStat, opts);
     const cachePath = cache.pathFor(name);
 
-    if (cache.has(name)) { cache.touch(name); return { cachePath, ext }; }
+    if (cache.has(name) || await cache.onDisk(name)) { cache.touch(name); return { cachePath, ext }; }
     if (this.inflight.has(name)) { await this.inflight.get(name); return { cachePath, ext }; }
 
     const p = (async () => {

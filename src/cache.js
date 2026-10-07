@@ -24,25 +24,53 @@ class VariantCache {
     this.index = new Map(); // name -> { size, mtime }
     this.bytes = 0;
     this.evicting = false;
+    this.warm = false; // true once init() has indexed the whole directory
   }
 
   has(name) { return this.index.has(name); }
+
+  /**
+   * Whether a variant is cached, for the request path. Once the index is warm it is the answer;
+   * while the boot scan is still running (the server listens before it ends), a variant the scan
+   * has not reached is looked up on disk and indexed, so it is served rather than made again.
+   */
+  async onDisk(name) {
+    if (this.index.has(name)) return true;
+    if (this.warm) return false;
+    try {
+      const st = await fsp.stat(this.pathFor(name));
+      if (!st.isFile()) return false;
+      if (!this.index.has(name)) { this.index.set(name, { size: st.size, mtime: st.mtimeMs }); this.bytes += st.size; }
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   // Absolute path of a cache entry by name.
   pathFor(name) { return path.join(this.dir, name); }
 
   // Scan the cache dir into the index; tolerant of a missing/empty dir.
+  // Runs after the server is listening (server.js), 16 stats at a time; entries the request
+  // path indexed meanwhile (onDisk/add) are not counted twice.
   async init() {
+    const started = Date.now();
     await fsp.mkdir(this.dir, { recursive: true });
     try {
-      for (const name of await fsp.readdir(this.dir)) {
-        try {
-          const st = await fsp.stat(this.pathFor(name));
-          if (st.isFile()) { this.index.set(name, { size: st.size, mtime: st.mtimeMs }); this.bytes += st.size; }
-        } catch {}
+      const names = await fsp.readdir(this.dir);
+      for (let i = 0; i < names.length; i += 16) {
+        await Promise.all(names.slice(i, i + 16).map(async (name) => {
+          if (this.index.has(name)) return;
+          try {
+            const st = await fsp.stat(this.pathFor(name));
+            if (st.isFile() && !this.index.has(name)) { this.index.set(name, { size: st.size, mtime: st.mtimeMs }); this.bytes += st.size; }
+          } catch {}
+        }));
       }
     } catch {}
-    console.log(`[media] cache: ${this.index.size} files, ${(this.bytes / 1048576).toFixed(1)} MiB (cap ${(this.maxBytes / 1048576).toFixed(0)} MiB)`);
+    this.warm = true;
+    console.log(`[media] cache: ${this.index.size} files, ${(this.bytes / 1048576).toFixed(1)} MiB (cap ${(this.maxBytes / 1048576).toFixed(0)} MiB), indexed in ${((Date.now() - started) / 1000).toFixed(1)} s`);
+    this.evictIfNeeded();
   }
 
   // Mark an entry as freshly used (LRU bump), best-effort on disk.

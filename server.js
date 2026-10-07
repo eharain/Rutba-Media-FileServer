@@ -47,8 +47,19 @@ function start(config = loadConfig()) {
 
   const clusterInfo = cluster.enabled ? `${config.clusterRole}, ${config.clusterPeers.length} peer(s)` : 'OFF';
   const volInfo = storage.multi ? `${storage.volumes.length} volumes (${config.storagePlacement})` : '1 volume';
+  // Listen first, then warm up. The server used to listen only after the cache index, the DB
+  // layer and the ffmpeg probe had settled. The cache index stats every cached variant one by
+  // one; with a large cache on Hostinger's IO-limited plan that outlasted LiteSpeed's ~2 minute
+  // wait for the app, so every request hung and came back as LiteSpeed's 500, and each restart
+  // began the same scan again (images.trustlist.uk, 2026-10-07). Nothing in the read path needs
+  // the warm-up: a variant the index has not reached yet is found on disk on its first request
+  // (cache.onDisk), visibility comes from sidecars and PRIVATE_PATHS rather than the DB, and
+  // ffmpeg features report themselves off until the probe answers.
+  server.listen(config.port, config.host, () =>
+    console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, storage ${volInfo}, sharp ${sharp ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}, cluster ${clusterInfo}`));
+
   // Warm the cache index, bring up the optional DB layer, and probe ffmpeg
-  // (best-effort — failures log and leave the feature off), then listen regardless.
+  // (best-effort — failures log and leave the feature off), then start the worker.
   Promise.allSettled([cache.init(), db.init(), ffmpeg.ready]).then(() => {
     // The background worker only exists alongside the DB layer, and only starts once
     // the layer actually came up. Nothing in the request path depends on it.
@@ -61,8 +72,7 @@ function start(config = loadConfig()) {
           .then((id) => id && console.log(`[media] jobs: boot scan queued as job ${id}`));
       }
     }
-    server.listen(config.port, config.host, () =>
-      console.log(`[media] listening ${config.host}:${config.port} — masters ${config.masterDir}, cache ${config.cacheDir}, storage ${volInfo}, sharp ${sharp ? 'on' : 'OFF'}, ffmpeg ${ffmpeg.enabled ? 'on' : 'OFF'}, writes ${config.uploadToken ? 'on' : 'OFF'}, cluster ${clusterInfo}, db ${db.enabled ? 'on' : 'OFF'}, jobs ${jobs.workerRunning ? 'on' : 'OFF'}`));
+    console.log(`[media] ready — ffmpeg ${ffmpeg.enabled ? 'on' : 'OFF'}, db ${db.enabled ? 'on' : 'OFF'}, jobs ${jobs.workerRunning ? 'on' : 'OFF'}`);
   });
 
   return { server, cache, db, jobs };
