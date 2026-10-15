@@ -140,7 +140,7 @@ breakpoint count for new uploads regardless.
 
 ## 8. Deployment targets
 - **Hostinger Business hosting** (`images.rutba.pk`/`images.trustlist.uk` → `77.37.37.27`):
-  hPanel Node.js app, startup `server.js`, Node 18+, Run NPM Install (for `sharp`), upload
+  hPanel Node.js app, startup `server.js`, Node 20.9+, Run NPM Install (for `sharp`), upload
   masters to `MASTER_DIR`. Needs SSH/FTP.
 - **VPS** (alternative): Docker container behind Caddy reading the Strapi masters volume;
   point `images.rutba.pk` at the VPS. No file migration, more CPU. (TO BUILD: Dockerfile +

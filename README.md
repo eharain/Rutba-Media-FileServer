@@ -140,7 +140,7 @@ CLUSTER_ROLE=private CLUSTER_SECRET=…  CLUSTER_PEERS="https://images.rutba.pk|
 
 ## Files
 ```
-server.js        # entrypoint — loads config, wires the app, starts listening (node>=18)
+server.js        # entrypoint: loads config, wires the app, starts listening (node>=20.9)
 src/             # the media service, split for reuse/testing:
   config.js      #   loadConfig(env) → immutable runtime config
   constants.js   #   MIME map, raster set, format→ext table
@@ -209,11 +209,11 @@ MySQL still runs `npm test` cleanly.
 > Both suites spawn `server.js` as its own process, which resolves `sharp` from the
 > **repo root**, so `npm install` at the root is required first (CI does this — see
 > `.github/workflows/ci.yml`, which runs the two suites as separate jobs across
-> Node 18/20/22).
+> Node 20/22).
 
 ## Deploy on Hostinger (hPanel → Node.js app)
 1. **hPanel → `images.rutba.pk` → Node.js** (Setup Node.js App).
-2. **Node 18+**, **startup file `server.js`**, **app root** = your upload folder, URL `images.rutba.pk`.
+2. **Node 20.9+** (sharp 0.35), **startup file `server.js`**, **app root** = your upload folder, URL `images.rutba.pk`.
 3. Upload `server.js`, `package.json`, the whole **`src/`** folder and — if you want the
    web console — **`web/`**; click **Run NPM Install** (installs `sharp`).
    All four are required at runtime: `src/` is the service itself, and `/_ui/` is served
