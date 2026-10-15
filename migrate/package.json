@@ -11,9 +11,9 @@
     "node": ">=18"
   },
   "dependencies": {
-    "mysql2": "^3.11.5"
+    "mysql2": "^3.24.6"
   },
   "optionalDependencies": {
-    "pg": "^8.13.1"
+    "pg": "^8.23.1"
   }
 }
