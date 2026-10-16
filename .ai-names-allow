@@ -1,0 +1,18 @@
+# Paths waived for the CONTENT scan in .githooks/pre-commit and pre-push.
+#
+# One glob per line, with the reason beside it. This waives CONTENT only:
+# the committer's identity, the commit message and the FILE NAME are never
+# exempted by anything in here, and the guard on those is unchanged.
+#
+# The file is committed on purpose. An exception recorded here is a decision
+# somebody can review in a diff; an exception made with `--no-verify` is a
+# decision nobody ever sees again.
+
+# The AI enrichment feature (src/ai.js) calls the provider's official SDK, and
+# package.json has to name that SDK in optionalDependencies for npm to install
+# it. The name is the package's real identifier, not an attribution. Without
+# this entry no commit could touch package.json at all, so every dependency
+# bump at the root (sharp, mysql2, the SDK itself) was blocked. The lockfile
+# is already skipped by the hook; package.json is the only path that needs it.
+# Approved by the owner on 2026-10-16.
+package.json
